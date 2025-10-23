@@ -27,7 +27,40 @@ library(plotly)
 # ==== Gas Plant: constants & helpers ====
 `%||%` <- function(x, y) { if (is.null(x) || length(x) == 0) return(y); x }
 
-GAS_BASE_DIR <- "C:/Users/I37643/OneDrive - Wood Mackenzie Limited/Documents/WoodMac/APP/Restart/HELLO"
+resolve_existing_dir <- function(candidates, fallback = ".") {
+  candidates <- unique(trimws(candidates))
+  candidates <- candidates[!is.na(candidates) & candidates != ""]
+  for (cand in candidates) {
+    candidate_path <- tryCatch(normalizePath(cand, winslash = "/", mustWork = FALSE),
+                               error = function(e) cand)
+    if (dir.exists(candidate_path)) return(candidate_path)
+  }
+  tryCatch(normalizePath(fallback, winslash = "/", mustWork = FALSE), error = function(e) fallback)
+}
+
+detect_app_directory <- function() {
+  script_dir <- tryCatch({
+    this_file <- normalizePath("appwithgasplant.R", winslash = "/", mustWork = FALSE)
+    dirname(this_file)
+  }, error = function(e) NA_character_)
+  resolve_existing_dir(c(
+    Sys.getenv("HELLO_APP_DIR", ""),
+    Sys.getenv("HELLO_BASE_PATH", ""),
+    getOption("hello.base_path", ""),
+    script_dir,
+    normalizePath(".", winslash = "/", mustWork = FALSE),
+    "C:/Users/I37643/OneDrive - Wood Mackenzie Limited/Documents/WoodMac/APP"
+  ))
+}
+
+app_base_dir <- detect_app_directory()
+
+GAS_BASE_DIR <- resolve_existing_dir(c(
+  Sys.getenv("HELLO_GAS_BASE_DIR", ""),
+  file.path(app_base_dir, "Restart", "HELLO"),
+  file.path(app_base_dir, "HELLO"),
+  app_base_dir
+))
 ST50_FILE    <- "st50_gas_plant_master.csv"
 MONTHLY_FILE <- "Vol_2025-01-AB.CSV"
 AVG_DAYS_PER_MONTH <- 30.4375
@@ -214,8 +247,10 @@ connect_to_db <- function() {
   })
 }
 
-# Initial connection attempt
-con <- connect_to_db()
+# Initial connection attempt (optional; defaults to lazy connection)
+if (isTRUE(as.logical(Sys.getenv("HELLO_EAGER_DB_CONNECT", "FALSE")))) {
+  con <- connect_to_db()
+}
 
 onStop(function() {
   if (!is.null(con) && dbIsValid(con)) {
@@ -225,7 +260,7 @@ onStop(function() {
 })
 
 # --- 1. Define File Paths and Constants ---
-base_path <- "C:/Users/I37643/OneDrive - Wood Mackenzie Limited/Documents/WoodMac/APP" # UPDATE THIS PATH
+base_path <- app_base_dir
 processed_rds_file <- file.path(base_path, "processed_app_data_vMERGED_FINAL_v24_DB_sticks_latlen.rds")
 
 woodmack_coverage_file_xlsx <- file.path(base_path, "Woodmack.Coverage.2024.xlsx")
@@ -401,10 +436,79 @@ empty_wells_df_for_sf$OperatorName <- character(); empty_wells_df_for_sf$Formati
 empty_wells_df_for_sf$FieldName <- character()
 empty_wells_df_for_sf$ConfidentialType <- character()
 
+cached_value_template <- function(template_col) {
+  if (inherits(template_col, "Date")) {
+    as.Date(NA_character_)
+  } else if (inherits(template_col, "POSIXct") || inherits(template_col, "POSIXlt")) {
+    as.POSIXct(NA_real_, origin = "1970-01-01", tz = "UTC")
+  } else if (is.numeric(template_col)) {
+    as.numeric(NA)
+  } else {
+    as.character(NA)
+  }
+}
+
+add_missing_columns_from_template <- function(df, template_df) {
+  for (col in names(template_df)) {
+    if (!col %in% names(df)) {
+      df[[col]] <- rep(cached_value_template(template_df[[col]]), nrow(df))
+    }
+  }
+  df
+}
+
+repair_cached_app_data <- function(cache, template_df) {
+  fixed <- cache
+  if (is.null(fixed) || !is.list(fixed)) fixed <- list()
+
+  wells_obj <- fixed$wells_sf
+  fixed$wells_sf <- tryCatch({
+    if (inherits(wells_obj, "sf")) {
+      wells_clean <- add_missing_columns_from_template(wells_obj, template_df)
+      tryCatch(sf::st_transform(wells_clean, 4326), error = function(e) wells_clean)
+    } else if (is.data.frame(wells_obj) && nrow(wells_obj) > 0) {
+      wells_df <- add_missing_columns_from_template(wells_obj, template_df)
+      if (all(c("SurfaceLongitude", "SurfaceLatitude") %in% names(wells_df))) {
+        wells_sf <- tryCatch(
+          sf::st_as_sf(wells_df, coords = c("SurfaceLongitude", "SurfaceLatitude"), crs = 4269,
+                       agr = "constant", remove = FALSE),
+          error = function(e) NULL
+        )
+        if (!is.null(wells_sf)) {
+          wells_sf <- add_missing_columns_from_template(wells_sf, template_df)
+          tryCatch(sf::st_transform(wells_sf, 4326), error = function(e) wells_sf)
+        } else {
+          sf::st_sf(template_df, geometry = sf::st_sfc(), crs = 4326)
+        }
+      } else {
+        sf::st_sf(template_df, geometry = sf::st_sfc(), crs = 4326)
+      }
+    } else {
+      sf::st_sf(template_df, geometry = sf::st_sfc(), crs = 4326)
+    }
+  }, error = function(e) {
+    message("Cached wells data invalid: ", e$message)
+    sf::st_sf(template_df, geometry = sf::st_sfc(), crs = 4326)
+  })
+
+  if (is.null(fixed$play_subplay_layers_list) || !is.list(fixed$play_subplay_layers_list)) {
+    fixed$play_subplay_layers_list <- list()
+  }
+  if (is.null(fixed$company_layers_list) || !is.list(fixed$company_layers_list)) {
+    fixed$company_layers_list <- list()
+  }
+  if (is.null(fixed$operator_lookup) || !is.data.frame(fixed$operator_lookup)) {
+    fixed$operator_lookup <- data.table::data.table()
+  }
+
+  fixed
+}
+
 app_data <- list(
   wells_sf = sf::st_sf(empty_wells_df_for_sf, geometry = sf::st_sfc(), crs = 4326),
   play_subplay_layers_list = list(),
-  company_layers_list = list()
+  company_layers_list = list(),
+  operator_lookup = data.table::data.table()
 )
 load_from_db <- TRUE
 
@@ -412,32 +516,23 @@ if (file.exists(processed_rds_file)) {
   message(paste("Attempting to load MERGED pre-processed data from:", processed_rds_file))
   tryCatch({
     loaded_data <- readRDS(processed_rds_file)
-    
-    wells_ok <- !is.null(loaded_data$wells_sf) && inherits(loaded_data$wells_sf, "sf") &&
-      nrow(loaded_data$wells_sf) > 0 &&
-      all(final_sf_column_names %in% names(sf::st_drop_geometry(loaded_data$wells_sf))) &&
-      ("CompletionDate" %in% names(loaded_data$wells_sf) && inherits(loaded_data$wells_sf$CompletionDate, "Date"))
-    
-    play_layers_ok <- !is.null(loaded_data$play_subplay_layers_list) && is.list(loaded_data$play_subplay_layers_list)
-    company_layers_ok <- !is.null(loaded_data$company_layers_list) && is.list(loaded_data$company_layers_list)
-    
-    if (play_layers_ok && length(loaded_data$play_subplay_layers_list) > 0) {
-      play_layers_ok <- all(sapply(loaded_data$play_subplay_layers_list, function(x) !is.null(x$data) && inherits(x$data, "sf")))
+    repaired <- repair_cached_app_data(loaded_data, empty_wells_df_for_sf)
+    wells_ok <- inherits(repaired$wells_sf, "sf") && nrow(repaired$wells_sf) > 0
+    if (!wells_ok) {
+      message("Cached wells data is empty after repair; database refresh required.")
     }
-    if (company_layers_ok && length(loaded_data$company_layers_list) > 0) {
-      company_layers_ok <- all(sapply(loaded_data$company_layers_list, function(x) !is.null(x$data) && inherits(x$data, "sf")))
+    if (!is.list(repaired$play_subplay_layers_list)) {
+      message("Cached play/subplay layers not a list; resetting to empty list.")
+      repaired$play_subplay_layers_list <- list()
     }
-    
-    if (wells_ok && play_layers_ok && company_layers_ok) {
-      app_data <- loaded_data
-      message("SUCCESS: Pre-processed data (including wells and layer lists) loaded and validated from RDS.")
+    if (!is.list(repaired$company_layers_list)) {
+      message("Cached company layers not a list; resetting to empty list.")
+      repaired$company_layers_list <- list()
+    }
+    app_data <- repaired
+    if (wells_ok) {
+      message("SUCCESS: Cached wells, shapefiles, and lookup data loaded from RDS. Skipping DB/shapefile refresh.")
       load_from_db <- FALSE
-    } else {
-      message("WARNING: RDS file loaded, but wells_sf data or layer lists are invalid/incomplete/empty. Will load from DB and re-process layers.")
-      app_data$wells_sf = sf::st_sf(empty_wells_df_for_sf, geometry = sf::st_sfc(), crs = 4326)
-      app_data$play_subplay_layers_list <- list()
-      app_data$company_layers_list <- list()
-      load_from_db <- TRUE
     }
   }, error = function(e) {
     message(paste("ERROR loading RDS file:", processed_rds_file, "-", e$message))
@@ -445,10 +540,15 @@ if (file.exists(processed_rds_file)) {
     app_data$wells_sf = sf::st_sf(empty_wells_df_for_sf, geometry = sf::st_sfc(), crs = 4326)
     app_data$play_subplay_layers_list <- list()
     app_data$company_layers_list <- list()
+    app_data$operator_lookup <- data.table::data.table()
     load_from_db <- TRUE
   })
 } else {
-  message("Pre-processed RDS file not found. Will load from DB and shapefiles.")
+  message(paste("Pre-processed RDS file not found at", processed_rds_file, "-- full data refresh required."))
+}
+
+if (!isFALSE(load_from_db)) {
+  load_from_db <- isTRUE(load_from_db)
 }
 
 message(paste0("--- Status before potential DB/Shapefile load: load_from_db = ", load_from_db, " ---"))
@@ -519,6 +619,7 @@ if (load_from_db) {
   if (nrow(operator_codes_dt) > 0 && all(c("OPERATOR", "GSL_PARENT_BA_NAME") %in% names(operator_codes_dt))) {
     operator_codes_final_dt <- operator_codes_dt[, .(WoodmackJoinOperatorCode = as.character(OPERATOR), OperatorNameDisplay = GSL_PARENT_BA_NAME)][!is.na(WoodmackJoinOperatorCode) & WoodmackJoinOperatorCode != "" & !is.na(OperatorNameDisplay) & OperatorNameDisplay != ""]; operator_codes_final_dt <- unique(operator_codes_final_dt, by = "WoodmackJoinOperatorCode")
   }
+  app_data$operator_lookup <- data.table::as.data.table(operator_codes_final_dt)
   combined_wells_dt <- data.table()
   if (nrow(wells_master_dt) > 0) {
     if ("OPERATOR_CODE" %in% names(wells_master_dt)) {
@@ -655,7 +756,31 @@ if (load_from_db) {
   
 }
 
+wells_lookup_dt <- data.table::as.data.table(app_data$operator_lookup)
+
 wells_sf_global <- app_data$wells_sf
+if (inherits(wells_sf_global, "sf") && nrow(wells_lookup_dt) > 0) {
+  lookup_df <- as.data.frame(wells_lookup_dt)
+  if (!"OperatorCode" %in% names(lookup_df) && "WoodmackJoinOperatorCode" %in% names(lookup_df)) {
+    lookup_df$OperatorCode <- as.character(lookup_df$WoodmackJoinOperatorCode)
+  }
+  if (!"OperatorName" %in% names(lookup_df) && "OperatorNameDisplay" %in% names(lookup_df)) {
+    lookup_df$OperatorName <- as.character(lookup_df$OperatorNameDisplay)
+  }
+  if (!"OperatorName" %in% names(wells_sf_global)) {
+    wells_sf_global$OperatorName <- rep(NA_character_, nrow(wells_sf_global))
+  }
+  if ("OperatorCode" %in% names(wells_sf_global) && "OperatorCode" %in% names(lookup_df) && "OperatorName" %in% names(lookup_df)) {
+    idx_na <- which(is.na(wells_sf_global$OperatorName) | wells_sf_global$OperatorName == "")
+    if (length(idx_na) > 0) {
+      joined_names <- lookup_df$OperatorName[match(wells_sf_global$OperatorCode[idx_na], lookup_df$OperatorCode)]
+      replace_idx <- which(!is.na(joined_names) & joined_names != "")
+      if (length(replace_idx) > 0) {
+        wells_sf_global$OperatorName[idx_na[replace_idx]] <- joined_names[replace_idx]
+      }
+    }
+  }
+}
 play_subplay_layers_list_global <- app_data$play_subplay_layers_list
 company_layers_list_global <- app_data$company_layers_list
 
