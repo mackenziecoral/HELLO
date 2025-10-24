@@ -261,7 +261,57 @@ onStop(function() {
 
 # --- 1. Define File Paths and Constants ---
 base_path <- app_base_dir
-processed_rds_file <- file.path(base_path, "processed_app_data_vMERGED_FINAL_v24_DB_sticks_latlen.rds")
+
+locate_processed_rds_file <- function(base_dir, default_filename) {
+  candidate_env <- trimws(Sys.getenv("HELLO_PROCESSED_RDS_FILE", ""))
+  expand_path <- function(path) {
+    if (!nzchar(path)) return(NA_character_)
+    tryCatch(normalizePath(path, winslash = "/", mustWork = FALSE), error = function(e) path)
+  }
+
+  env_path <- expand_path(candidate_env)
+  default_path <- expand_path(file.path(base_dir, default_filename))
+  working_dir_path <- expand_path(file.path(getwd(), default_filename))
+  candidates <- unique(Filter(
+    function(p) nzchar(p),
+    c(env_path, default_path, working_dir_path)
+  ))
+
+  for (cand in candidates) {
+    if (nzchar(cand) && file.exists(cand)) {
+      if (!identical(cand, default_path)) {
+        message("Using processed RDS cache from ", cand)
+      }
+      return(cand)
+    }
+  }
+
+  find_latest_processed <- function(search_dir) {
+    if (!dir.exists(search_dir)) return(NA_character_)
+    files <- list.files(
+      search_dir,
+      pattern = "processed_app_data.*\\.rds$",
+      ignore.case = TRUE,
+      full.names = TRUE
+    )
+    if (!length(files)) return(NA_character_)
+    files[which.max(file.info(files)$mtime)]
+  }
+
+  fallback <- unique(Filter(
+    function(p) nzchar(p) && file.exists(p),
+    c(find_latest_processed(base_dir), find_latest_processed(getwd()))
+  ))
+
+  if (length(fallback)) {
+    message("Processed RDS cache not found at default path; falling back to ", fallback[[1]])
+    return(fallback[[1]])
+  }
+
+  default_path
+}
+
+processed_rds_file <- locate_processed_rds_file(base_path, "processed_app_data_vMERGED_FINAL_v24_DB_sticks_latlen.rds")
 
 woodmack_coverage_file_xlsx <- file.path(base_path, "Woodmack.Coverage.2024.xlsx")
 play_subplay_shapefile_dir <- file.path(base_path, "SubplayShapefile")
@@ -754,6 +804,8 @@ if (load_from_db) {
   })
   # --- END OF SHAPEFILE LOADING LOGIC ---
   
+} else {
+  message("Cache satisfied; using cached wells and shapefiles without database refresh.")
 }
 
 wells_lookup_dt <- data.table::as.data.table(app_data$operator_lookup)
