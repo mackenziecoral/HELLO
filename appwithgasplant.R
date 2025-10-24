@@ -388,10 +388,10 @@ prepare_filter_choices <- function(column_vector, col_name_for_msg = "column") {
     message(paste0("DEBUG (prepare_filter_choices): Input vector for '", col_name_for_msg, "' is NULL or empty."))
     return(character(0))
   }
-  column_vector_char <- as.character(column_vector)
+  column_vector_char <- trimws(as.character(column_vector))
   num_na_initial <- sum(is.na(column_vector_char))
   num_empty_initial <- sum(column_vector_char == "", na.rm = TRUE)
-  
+
   choices <- column_vector_char[!is.na(column_vector_char) & column_vector_char != "" & column_vector_char != "NA"]
   choices <- sort(unique(choices))
   
@@ -811,26 +811,65 @@ if (load_from_db) {
 wells_lookup_dt <- data.table::as.data.table(app_data$operator_lookup)
 
 wells_sf_global <- app_data$wells_sf
-if (inherits(wells_sf_global, "sf") && nrow(wells_lookup_dt) > 0) {
-  lookup_df <- as.data.frame(wells_lookup_dt)
-  if (!"OperatorCode" %in% names(lookup_df) && "WoodmackJoinOperatorCode" %in% names(lookup_df)) {
-    lookup_df$OperatorCode <- as.character(lookup_df$WoodmackJoinOperatorCode)
-  }
-  if (!"OperatorName" %in% names(lookup_df) && "OperatorNameDisplay" %in% names(lookup_df)) {
-    lookup_df$OperatorName <- as.character(lookup_df$OperatorNameDisplay)
-  }
+if (inherits(wells_sf_global, "sf")) {
   if (!"OperatorName" %in% names(wells_sf_global)) {
     wells_sf_global$OperatorName <- rep(NA_character_, nrow(wells_sf_global))
   }
-  if ("OperatorCode" %in% names(wells_sf_global) && "OperatorCode" %in% names(lookup_df) && "OperatorName" %in% names(lookup_df)) {
-    idx_na <- which(is.na(wells_sf_global$OperatorName) | wells_sf_global$OperatorName == "")
-    if (length(idx_na) > 0) {
-      joined_names <- lookup_df$OperatorName[match(wells_sf_global$OperatorCode[idx_na], lookup_df$OperatorCode)]
-      replace_idx <- which(!is.na(joined_names) & joined_names != "")
-      if (length(replace_idx) > 0) {
-        wells_sf_global$OperatorName[idx_na[replace_idx]] <- joined_names[replace_idx]
-      }
+
+  fill_from_lookup <- function(op_vals) {
+    if (nrow(wells_lookup_dt) == 0) return(op_vals)
+    lookup_df <- as.data.frame(wells_lookup_dt)
+    if (!"OperatorCode" %in% names(lookup_df) && "WoodmackJoinOperatorCode" %in% names(lookup_df)) {
+      lookup_df$OperatorCode <- as.character(lookup_df$WoodmackJoinOperatorCode)
     }
+    if (!"OperatorName" %in% names(lookup_df) && "OperatorNameDisplay" %in% names(lookup_df)) {
+      lookup_df$OperatorName <- as.character(lookup_df$OperatorNameDisplay)
+    }
+    if (!all(c("OperatorCode", "OperatorName") %in% names(lookup_df))) return(op_vals)
+    if (!"OperatorCode" %in% names(wells_sf_global)) return(op_vals)
+    op_trim <- trimws(op_vals)
+    idx_na <- which(is.na(op_trim) | op_trim == "")
+    if (length(idx_na) == 0) return(op_vals)
+    joined_names <- lookup_df$OperatorName[match(wells_sf_global$OperatorCode[idx_na], lookup_df$OperatorCode)]
+    joined_trim <- trimws(as.character(joined_names))
+    valid_idx <- which(!is.na(joined_trim) & joined_trim != "")
+    if (length(valid_idx) == 0) return(op_vals)
+    op_vals[idx_na[valid_idx]] <- joined_trim[valid_idx]
+    op_vals
+  }
+
+  fill_from_fallback_cols <- function(op_vals) {
+    fallback_cols <- c(
+      "OperatorNameDisplay", "OperatorName_display", "Operator",
+      "CurrentOperator", "Current_Operator", "Operator_Current",
+      "OperatingCompany", "OperatorNameLabel", "WellOperator",
+      "WellOperatorName"
+    )
+    op_trim <- trimws(op_vals)
+    missing_idx <- which(is.na(op_trim) | op_trim == "")
+    if (length(missing_idx) == 0) return(op_vals)
+    for (col in fallback_cols) {
+      if (!col %in% names(wells_sf_global)) next
+      candidate <- trimws(as.character(wells_sf_global[[col]]))
+      if (!any(!is.na(candidate) & candidate != "")) next
+      fill_idx <- missing_idx[!is.na(candidate[missing_idx]) & candidate[missing_idx] != ""]
+      if (length(fill_idx) == 0) next
+      op_vals[fill_idx] <- candidate[fill_idx]
+      op_trim <- trimws(op_vals)
+      missing_idx <- which(is.na(op_trim) | op_trim == "")
+      if (length(missing_idx) == 0) break
+    }
+    op_vals
+  }
+
+  op_vals <- as.character(wells_sf_global$OperatorName)
+  op_vals <- fill_from_lookup(op_vals)
+  op_vals <- fill_from_fallback_cols(op_vals)
+
+  if ("OperatorName" %in% names(wells_sf_global)) {
+    op_clean <- trimws(as.character(op_vals))
+    op_clean[op_clean == ""] <- NA_character_
+    wells_sf_global$OperatorName <- op_clean
   }
 }
 play_subplay_layers_list_global <- app_data$play_subplay_layers_list
@@ -1236,13 +1275,20 @@ server <- function(input, output, session) {
 
   safe_gor_palette <- function(x, n = 7) {
     dom <- x[is.finite(x)]
-    if (length(dom) < 2 || diff(range(dom)) <= .Machine$double.eps) {
-      return(leaflet::colorNumeric("viridis", domain = range(dom %||% c(0,1), na.rm = TRUE)))
+    if (!length(dom)) {
+      return(leaflet::colorNumeric("viridis", domain = c(0, 1)))
     }
-    qs <- stats::quantile(dom, probs = seq(0, 1, length.out = n + 1), na.rm = TRUE)
+    rng <- range(dom, na.rm = TRUE)
+    if (diff(rng) <= .Machine$double.eps) {
+      return(leaflet::colorNumeric("viridis", domain = rng))
+    }
+    qs <- stats::quantile(dom, probs = seq(0, 1, length.out = n + 1), na.rm = TRUE, type = 7)
     if (length(unique(as.numeric(qs))) <= 2) {
-      brks <- unique(pretty(range(dom, na.rm = TRUE), n = n))
-      if (length(brks) < 3) return(leaflet::colorNumeric("viridis", domain = range(dom, na.rm = TRUE)))
+      brks <- sort(unique(pretty(rng, n = n)))
+      brks <- brks[is.finite(brks)]
+      if (length(brks) < 3 || any(diff(brks) <= 0)) {
+        return(leaflet::colorNumeric("viridis", domain = rng))
+      }
       return(leaflet::colorBin("viridis", domain = dom, bins = brks, pretty = FALSE))
     }
     leaflet::colorQuantile("viridis", domain = dom, n = n)
