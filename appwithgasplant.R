@@ -1072,7 +1072,8 @@ server <- function(input, output, session) {
       if (!is.numeric(out[[col]])) out[, (col) := as.numeric(get(col))]
       out[is.na(get(col)), (col) := 0]
     }
-    out[, LiquidsBBL := if (use_cnd) OilBBL + CndBBL else OilBBL]
+    include_cnd_flag <- isTRUE(use_cnd)
+    out[, LiquidsBBL := OilBBL + if (isTRUE(include_cnd_flag)) CndBBL else 0]
     out[, GOR_MCF_PER_BBL := data.table::fifelse(
       LiquidsBBL > 0, GasMCF / LiquidsBBL,
       data.table::fifelse(GasMCF > 0, Inf, NA_real_)
@@ -1174,7 +1175,8 @@ server <- function(input, output, session) {
       if (!is.numeric(out[[col]])) out[, (col) := as.numeric(get(col))]
       out[is.na(get(col)), (col) := 0]
     }
-    out[, LiquidsBBL := if (include_cnd) OilBBL + CndBBL else OilBBL]
+    include_cnd_flag <- isTRUE(include_cnd)
+    out[, LiquidsBBL := OilBBL + if (isTRUE(include_cnd_flag)) CndBBL else 0]
     out[, GOR_MCF_PER_BBL := data.table::fifelse(
       LiquidsBBL > 0, GasMCF / LiquidsBBL,
       data.table::fifelse(GasMCF > 0, Inf, NA_real_)
@@ -1187,6 +1189,44 @@ server <- function(input, output, session) {
 
     data.table::setorder(out, GSL_UWI_STD, PROD_DATE)
     out
+  }
+
+  # —— Robust capping for GOR used in color/plots ——
+  cap_gor_for_plot <- function(x) {
+    x_num <- suppressWarnings(as.numeric(x))
+    finite <- is.finite(x_num)
+    if (!any(finite, na.rm = TRUE)) {
+      return(list(vals = rep(NA_real_, length(x_num)), cap = NA_real_))
+    }
+    cap <- stats::quantile(x_num[finite], probs = 0.99, na.rm = TRUE, type = 7)
+    if (!is.finite(cap) || is.na(cap) || cap <= 0) cap <- max(x_num[finite], na.rm = TRUE)
+    if (!is.finite(cap) || is.na(cap) || cap <= 0) cap <- 1
+    x_cap <- x_num
+    x_cap[is.infinite(x_cap)] <- cap
+    x_cap[finite & x_cap > cap] <- cap
+    list(vals = x_cap, cap = cap)
+  }
+
+  # —— Palette that never produces duplicate breaks ——
+  safe_gor_palette <- function(x, n = 7) {
+    x_num <- suppressWarnings(as.numeric(x))
+    dom <- x_num[is.finite(x_num)]
+    if (length(dom) < 2 || (max(dom) - min(dom)) <= .Machine$double.eps) {
+      rng <- range(dom, na.rm = TRUE)
+      if (!is.finite(rng[1])) rng <- c(0, 1)
+      return(leaflet::colorNumeric("viridis", domain = rng))
+    }
+    qs <- stats::quantile(dom, probs = seq(0, 1, length.out = n + 1), na.rm = TRUE)
+    uq <- unique(as.numeric(qs))
+    if (length(uq) <= 2) {
+      brks <- pretty(range(dom, na.rm = TRUE), n = n)
+      brks <- unique(brks)
+      if (length(brks) < 3) {
+        return(leaflet::colorNumeric("viridis", domain = range(dom, na.rm = TRUE)))
+      }
+      return(leaflet::colorBin("viridis", domain = dom, bins = brks, pretty = FALSE))
+    }
+    leaflet::colorQuantile("viridis", domain = dom, n = n)
   }
 
   compute_map_with_gor <- function(base_df) {
@@ -1248,22 +1288,23 @@ server <- function(input, output, session) {
     }
 
     range_vals <- input$gor_range
+    capd_filter <- cap_gor_for_plot(df_out$GOR_Latest)
+    gor_filter_vals <- capd_filter$vals
     if (!is.null(range_vals) && length(range_vals) == 2) {
       lo <- range_vals[1]
       hi <- range_vals[2]
-      gor_filter_cap <- 50000
-      gor_filter_vals <- df_out$GOR_Latest
-      gor_filter_vals[is.infinite(gor_filter_vals)] <- gor_filter_cap
-      gor_filter_vals <- pmin(gor_filter_vals, gor_filter_cap)
       keep_idx <- is.na(df_out$GOR_Latest) | (gor_filter_vals >= lo & gor_filter_vals <= hi)
-      df_out <- df_out[keep_idx, ]
-      gor_filter_vals <- gor_filter_vals[keep_idx]
+      keep_idx <- as.logical(keep_idx)
+      keep_idx[is.na(keep_idx)] <- FALSE
+      if (!all(keep_idx)) {
+        df_out <- df_out[keep_idx, , drop = FALSE]
+        gor_filter_vals <- gor_filter_vals[keep_idx]
+      }
+    }
+    if (length(gor_filter_vals) == nrow(df_out)) {
       df_out$GOR_Capped_ForColor <- gor_filter_vals
     } else {
-      gor_filter_cap <- 50000
-      gor_filter_vals <- df_out$GOR_Latest
-      gor_filter_vals[is.infinite(gor_filter_vals)] <- gor_filter_cap
-      df_out$GOR_Capped_ForColor <- pmin(gor_filter_vals, gor_filter_cap)
+      df_out$GOR_Capped_ForColor <- rep(NA_real_, nrow(df_out))
     }
 
     df_out
@@ -1862,36 +1903,16 @@ server <- function(input, output, session) {
     # Well Markers (Surface Points) and Well Sticks (Polylines)
     if (!is.null(df_map) && inherits(df_map, "sf") && nrow(df_map) > 0) {
 
-      gor_plot_cap <- {
-        finite_vals <- df_map$GOR_Latest[is.finite(df_map$GOR_Latest)]
-        if (length(finite_vals)) {
-          stats::quantile(finite_vals, 0.99, na.rm = TRUE)
-        } else {
-          NA_real_
-        }
+      capd <- cap_gor_for_plot(df_map$GOR_Latest)
+      gor_for_color <- capd$vals
+      pal_gor <- safe_gor_palette(gor_for_color, n = 7)
+      color_mask <- is.finite(gor_for_color)
+      color_mask[is.na(color_mask)] <- FALSE
+      df_map$GOR_Color <- rep("#9E9E9E", nrow(df_map))
+      if (any(color_mask)) {
+        df_map$GOR_Color[color_mask] <- pal_gor(gor_for_color[color_mask])
       }
-      if (!is.finite(gor_plot_cap) || gor_plot_cap <= 0) gor_plot_cap <- 50000
-      gor_for_color <- df_map$GOR_Latest
-      gor_for_color[is.infinite(gor_for_color)] <- gor_plot_cap
-      gor_for_color <- pmin(gor_for_color, gor_plot_cap)
       df_map$GOR_Capped_ForColor <- gor_for_color
-
-      pal_vals <- df_map$GOR_Capped_ForColor
-      pal_vals_ok <- pal_vals[is.finite(pal_vals)]
-      fallback_max <- if (length(pal_vals_ok)) max(pal_vals_ok, na.rm = TRUE) else gor_plot_cap
-      if (!is.finite(fallback_max) || fallback_max <= 0) fallback_max <- gor_plot_cap
-      pal_gor <- NULL
-      if (length(pal_vals_ok) >= 5 && length(unique(pal_vals_ok)) >= 2) {
-        pal_gor <- tryCatch(
-          colorQuantile("viridis", domain = pal_vals_ok, n = 7),
-          error = function(e) NULL
-        )
-      }
-      if (is.null(pal_gor)) {
-        pal_gor <- colorNumeric("viridis", domain = c(0, fallback_max))
-      }
-      marker_colors <- ifelse(!is.na(pal_vals), pal_gor(pal_vals), "#9E9E9E")
-      df_map$GOR_Color <- marker_colors
 
       well_layer_id_col_name <- if (!"GSL_UWI_Std" %in% names(df_map) || !is.character(df_map$GSL_UWI_Std)) {
         df_map$GSL_UWI_Std_for_map <- paste0("wellmarker_", seq_len(nrow(df_map)))
@@ -1926,10 +1947,11 @@ server <- function(input, output, session) {
                "")
       } else { rep("", nrow(df_map)) }
 
-      gor_value_text <- ifelse(is.infinite(df_map$GOR_Latest),
-                               "∞ (100% gas)",
-                               ifelse(!is.na(df_map$GOR_Latest),
-                                      scales::comma(round(df_map$GOR_Latest, 1)),
+      is_inf_vec <- is.infinite(df_map$GOR_Latest)
+      gor_value_text <- ifelse(is_inf_vec,
+                               "100% gas (∞ GOR)",
+                               ifelse(is.finite(df_map$GOR_Latest),
+                                      paste0(scales::comma(round(df_map$GOR_Latest, 1)), " MCF/BBL"),
                                       "NA"))
       gor_month_text <- ifelse(!is.na(df_map$GOR_Latest_Month),
                                format(df_map$GOR_Latest_Month, "%Y-%m"),
@@ -1951,7 +1973,7 @@ server <- function(input, output, session) {
                                    "NA")
       cnd_line <- if (isTRUE(input$gor_include_cnd)) paste0("<br><b>Monthly Condensate (BBL):</b> ", cnd_text) else ""
       gor_popup <- paste0(
-        "<br><b>GOR (MCF/BBL):</b> ", gor_value_text,
+        "<br><b>GOR:</b> ", gor_value_text,
         "<br><b>GOR Month:</b> ", gor_month_text,
         "<br><b>Monthly Gas (MCF):</b> ", gas_text,
         "<br><b>Monthly Oil (BBL):</b> ", oil_text,
@@ -1995,12 +2017,15 @@ server <- function(input, output, session) {
         }
       }
 
-      if (length(pal_vals_ok) > 0) {
+      dom <- gor_for_color[is.finite(gor_for_color)]
+      if (!length(dom)) {
+        message("[GOR] No finite domain for legend; skipping legend.")
+      } else {
         proxy %>% addLegend(
           position = "bottomright",
           pal = pal_gor,
-          values = pal_vals_ok,
-          title = "GOR (MCF/BBL, ∞ shown at cap)",
+          values = dom,
+          title = htmltools::HTML("GOR (MCF/BBL)<br/><span style='font-weight:400'>(∞ shown at cap)</span>"),
           opacity = 0.9,
           layerId = "gor_legend"
         )
@@ -2575,14 +2600,13 @@ server <- function(input, output, session) {
 
   output$gor_trend_by_month_plot <- renderPlot({
     gor_dt <- gor_data_filtered()
-    if (is.null(gor_dt) || nrow(gor_dt) == 0) {
-      return(ggplot() + labs(title = "No wells in current filter.", x = NULL, y = NULL) + theme_void())
-    }
+    validate(need(!is.null(gor_dt) && nrow(gor_dt) > 0, "No wells in current filter."))
 
     plot_dt <- gor_dt[!is.na(MonthOnProduction) & MonthOnProduction >= 1]
-    if (nrow(plot_dt) == 0) {
-      return(ggplot() + labs(title = "No production months available for GOR trend.", x = NULL, y = NULL) + theme_void())
-    }
+    validate(need(nrow(plot_dt) > 0, "No production months available for GOR trend."))
+
+    capd <- cap_gor_for_plot(plot_dt$GOR_MCF_PER_BBL)
+    plot_dt[, GOR_for_plot := capd$vals]
 
     if ("Formation" %in% names(plot_dt) && any(!is.na(plot_dt$Formation) & trimws(plot_dt$Formation) != "")) {
       plot_dt[, Group := ifelse(is.na(Formation) | trimws(Formation) == "", "(Unknown)", Formation)]
@@ -2595,20 +2619,11 @@ server <- function(input, output, session) {
       color_label <- "Group"
     }
 
-    finite_vals <- plot_dt[is.finite(GOR_MCF_PER_BBL), GOR_MCF_PER_BBL]
-    gor_cap <- if (length(finite_vals)) stats::quantile(finite_vals, 0.99, na.rm = TRUE) else 50000
-    if (!is.finite(gor_cap) || gor_cap <= 0) gor_cap <- 50000
-
-    plot_dt[, GOR_for_plot := data.table::fifelse(
-      is.na(GOR_MCF_PER_BBL), NA_real_,
-      pmin(data.table::fifelse(is.infinite(GOR_MCF_PER_BBL), gor_cap, GOR_MCF_PER_BBL), gor_cap)
-    )]
-
-    agg <- plot_dt[, .(MedianGOR = stats::median(GOR_for_plot, na.rm = TRUE)), by = .(Group, MonthOnProduction)]
-    agg <- agg[!is.na(MedianGOR)]
-    if (nrow(agg) == 0) {
-      return(ggplot() + labs(title = "No valid GOR data to plot.", x = NULL, y = NULL) + theme_void())
-    }
+    agg <- plot_dt[, .(
+      MedianGOR = if (all(is.na(GOR_for_plot))) NA_real_ else stats::median(GOR_for_plot, na.rm = TRUE)
+    ), by = .(Group, MonthOnProduction)]
+    agg <- agg[is.finite(MedianGOR)]
+    validate(need(nrow(agg) > 0, "No valid GOR data to plot."))
 
     unique_groups <- unique(agg$Group)
     group_colors <- custom_palette[1:min(length(unique_groups), length(custom_palette))]
@@ -2635,21 +2650,20 @@ server <- function(input, output, session) {
 
   output$gas_weighting_by_vintage_plot <- renderPlot({
     gor_dt <- gor_data_filtered()
-    if (is.null(gor_dt) || nrow(gor_dt) == 0) {
-      return(ggplot() + labs(title = "No wells in current filter.", x = NULL, y = NULL) + theme_void())
-    }
+    validate(need(!is.null(gor_dt) && nrow(gor_dt) > 0, "No wells in current filter."))
 
-    plot_dt <- gor_dt[!is.na(VintageYear) & !is.na(YearOnProduction) & YearOnProduction >= 1]
-    if (nrow(plot_dt) == 0) {
-      return(ggplot() + labs(title = "No gas weighting data for current filters.", x = NULL, y = NULL) + theme_void())
-    }
+    dsw <- gor_dt[is.finite(GasWeighting) & GasWeighting >= 0 & GasWeighting <= 1]
+    validate(need(nrow(dsw) > 0, "No valid GasWeighting values in range."))
+
+    plot_dt <- dsw[!is.na(VintageYear) & !is.na(YearOnProduction) & YearOnProduction >= 1]
+    validate(need(nrow(plot_dt) > 0, "No gas weighting data for current filters."))
 
     plot_dt[, VintageYear := as.character(VintageYear)]
-    agg <- plot_dt[, .(AvgGasWeighting = mean(GasWeighting, na.rm = TRUE)), by = .(VintageYear, YearOnProduction)]
-    agg <- agg[!is.na(AvgGasWeighting)]
-    if (nrow(agg) == 0) {
-      return(ggplot() + labs(title = "No gas weighting data for current filters.", x = NULL, y = NULL) + theme_void())
-    }
+    agg <- plot_dt[, .(
+      AvgGasWeighting = if (all(is.na(GasWeighting))) NA_real_ else mean(GasWeighting, na.rm = TRUE)
+    ), by = .(VintageYear, YearOnProduction)]
+    agg <- agg[is.finite(AvgGasWeighting)]
+    validate(need(nrow(agg) > 0, "No gas weighting data for current filters."))
 
     agg[, VintageYear := factor(VintageYear, levels = sort(unique(VintageYear)))]
     unique_vintages <- levels(agg$VintageYear)
