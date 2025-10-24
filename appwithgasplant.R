@@ -1880,9 +1880,14 @@ server <- function(input, output, session) {
       pal_vals_ok <- pal_vals[is.finite(pal_vals)]
       fallback_max <- if (length(pal_vals_ok)) max(pal_vals_ok, na.rm = TRUE) else gor_plot_cap
       if (!is.finite(fallback_max) || fallback_max <= 0) fallback_max <- gor_plot_cap
-      if (length(pal_vals_ok) >= 5) {
-        pal_gor <- colorQuantile("viridis", domain = pal_vals_ok, n = 7)
-      } else {
+      pal_gor <- NULL
+      if (length(pal_vals_ok) >= 5 && length(unique(pal_vals_ok)) >= 2) {
+        pal_gor <- tryCatch(
+          colorQuantile("viridis", domain = pal_vals_ok, n = 7),
+          error = function(e) NULL
+        )
+      }
+      if (is.null(pal_gor)) {
         pal_gor <- colorNumeric("viridis", domain = c(0, fallback_max))
       }
       marker_colors <- ifelse(!is.na(pal_vals), pal_gor(pal_vals), "#9E9E9E")
