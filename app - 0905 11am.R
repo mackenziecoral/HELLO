@@ -672,6 +672,17 @@ ui <- fluidPage(
                             h5("Operator Group Production Data Summary (Monthly, Cumulative, and Avg Daily Rates)"),
                             downloadButton("download_group_prod_data", "Download Operator Group Summary as CSV"),
                             DT::dataTableOutput("grouped_production_table")
+                   ),
+                   tabPanel("GOR",
+                            h4("GOR & Gas Weighting (map-filtered wells)"),
+                            p("Uses current main filters, the Production date range, and the Oil+Condensate toggle."),
+                            fluidRow(
+                              column(6, plotOutput("gor_trend_by_month_plot", height = "45vh")),
+                              column(6, plotOutput("gas_weighting_by_vintage_plot", height = "45vh"))
+                            ),
+                            hr(),
+                            downloadButton("download_gor_timeseries_csv", "Download GOR Timeseries (CSV)"),
+                            DT::dataTableOutput("gor_timeseries_table")
                    )
                  )
         )
@@ -696,7 +707,121 @@ server <- function(input, output, session) {
     min_first_prod_date_overall = as.Date("1900-01-01"),
     max_first_prod_date_overall = Sys.Date()
   )
-  
+
+  compute_gor_timeseries_for_wells <- function(uwis, date_start, date_end, include_cnd = TRUE) {
+    if (length(uwis) == 0) return(data.table::data.table())
+
+    if (is.null(con) || !DBI::dbIsValid(con)) {
+      con <<- connect_to_db()
+      if (is.null(con) || !DBI::dbIsValid(con)) return(data.table::data.table())
+    }
+
+    uwis <- unique(na.omit(uwis))
+    batches <- split(uwis, ceiling(seq_along(uwis) / 300))
+    out_list <- vector("list", length(batches))
+
+    for (i in seq_along(batches)) {
+      sql <- glue::glue_sql(
+        "SELECT GSL_UWI, YEAR, PRODUCT_TYPE,
+                JAN_VOLUME, FEB_VOLUME, MAR_VOLUME, APR_VOLUME, MAY_VOLUME, JUN_VOLUME,
+                JUL_VOLUME, AUG_VOLUME, SEP_VOLUME, OCT_VOLUME, NOV_VOLUME, DEC_VOLUME
+         FROM PDEN_VOL_BY_MONTH
+         WHERE GSL_UWI IN ({uwis*})
+           AND ACTIVITY_TYPE = 'PRODUCTION'
+           AND PRODUCT_TYPE IN ('OIL','CND','GAS')",
+        uwis = batches[[i]], .con = con
+      )
+      out_list[[i]] <- tryCatch(data.table::as.data.table(DBI::dbGetQuery(con, sql)),
+                                error = function(e) data.table::data.table())
+    }
+
+    raw <- data.table::rbindlist(out_list, use.names = TRUE, fill = TRUE)
+    if (nrow(raw) == 0) return(raw)
+
+    raw[, GSL_UWI_STD := standardize_uwi(GSL_UWI)]
+    dt <- clean_df_colnames(raw, "PDEN_VOL_BY_MONTH")
+    data.table::setDT(dt)
+
+    month_cols <- toupper(paste0(month.abb, "_VOLUME"))
+    month_cols <- month_cols[month_cols %in% names(dt)]
+    if (length(month_cols) != 12 || !all(c("GSL_UWI_STD","YEAR","PRODUCT_TYPE") %in% names(dt))) return(data.table::data.table())
+    for (cn in c("YEAR", month_cols)) if (!is.numeric(dt[[cn]])) dt[, (cn) := as.numeric(get(cn))]
+
+    long <- data.table::melt(dt, id.vars = c("GSL_UWI_STD","YEAR","PRODUCT_TYPE"),
+                 measure.vars = month_cols, variable.name = "MonCol", value.name = "VOL")
+    long[is.na(VOL), VOL := 0]
+    long[, Mon := match(gsub("_VOLUME","", MonCol), toupper(month.abb))]
+    long[, PROD_DATE := as.Date(sprintf("%d-%02d-01", YEAR, Mon))]
+    long <- long[PROD_DATE >= as.Date(date_start) & PROD_DATE <= as.Date(date_end)]
+    long[, PRODUCT_TYPE := toupper(PRODUCT_TYPE)]
+
+    oil <- long[PRODUCT_TYPE == "OIL", .(OilBBL = sum(VOL)), by = .(GSL_UWI_STD, PROD_DATE)]
+    cnd <- long[PRODUCT_TYPE == "CND", .(CndBBL = sum(VOL)), by = .(GSL_UWI_STD, PROD_DATE)]
+    gas <- long[PRODUCT_TYPE == "GAS", .(GasMCF = sum(VOL)), by = .(GSL_UWI_STD, PROD_DATE)]
+
+    m <- merge(merge(oil, cnd, by = c("GSL_UWI_STD","PROD_DATE"), all = TRUE),
+               gas, by = c("GSL_UWI_STD","PROD_DATE"), all = TRUE)
+    m[is.na(m)] <- 0
+
+    m[, LiquidsBBL := OilBBL + if (isTRUE(include_cnd)) CndBBL else 0]
+    m[, GOR_MCF_PER_BBL := fifelse(LiquidsBBL > 0, GasMCF/LiquidsBBL,
+                                   fifelse(GasMCF > 0, Inf, NA_real_))]
+    m[, GasWeighting := fifelse((GasMCF + LiquidsBBL) > 0, GasMCF/(GasMCF + LiquidsBBL), NA_real_)]
+
+    m <- m[order(GSL_UWI_STD, PROD_DATE)]
+    first_prod <- m[(GasMCF + LiquidsBBL) > 0, .(FirstMonth = min(PROD_DATE)), by = GSL_UWI_STD]
+    m <- merge(m, first_prod, by = "GSL_UWI_STD", all.x = TRUE)
+    m[, MonthOnProd := as.integer((lubridate::interval(FirstMonth, PROD_DATE) %/% lubridate::months(1))) + 1]
+    m[, YearOnProd := as.integer((lubridate::interval(FirstMonth, PROD_DATE) / lubridate::years(1))) + 1]
+    m[, VintageYear := lubridate::year(FirstMonth)]
+    m[]
+  }
+
+  cap_gor_for_plot <- function(x) {
+    x_num <- suppressWarnings(as.numeric(x))
+    finite <- is.finite(x_num)
+    if (!any(finite)) return(list(vals = rep(NA_real_, length(x_num)), cap = NA_real_))
+    cap <- stats::quantile(x_num[finite], probs = 0.99, na.rm = TRUE, type = 7)
+    if (!is.finite(cap) || is.na(cap) || cap <= 0) cap <- max(x_num[finite], na.rm = TRUE)
+    if (!is.finite(cap) || is.na(cap) || cap <= 0) cap <- 1
+    x_cap <- x_num
+    x_cap[is.infinite(x_cap)] <- cap
+    x_cap[finite & x_cap > cap] <- cap
+    list(vals = x_cap, cap = cap)
+  }
+
+  safe_gor_palette <- function(x, n = 7) {
+    dom <- x[is.finite(x)]
+    if (length(dom) < 2 || diff(range(dom)) <= .Machine$double.eps) {
+      dom_range <- if (length(dom) == 0) c(0, 1) else range(dom, na.rm = TRUE)
+      if (!all(is.finite(dom_range))) dom_range <- c(0, 1)
+      return(leaflet::colorNumeric("viridis", domain = dom_range))
+    }
+    qs <- stats::quantile(dom, probs = seq(0, 1, length.out = n + 1), na.rm = TRUE)
+    if (length(unique(as.numeric(qs))) <= 2) {
+      brks <- unique(pretty(range(dom, na.rm = TRUE), n = n))
+      if (length(brks) < 3) return(leaflet::colorNumeric("viridis", domain = range(dom, na.rm = TRUE)))
+      return(leaflet::colorBin("viridis", domain = dom, bins = brks, pretty = FALSE))
+    }
+    leaflet::colorQuantile("viridis", domain = dom, n = n)
+  }
+
+  gor_data_filtered <- reactive({
+    df <- reactive_vals$wells_to_display
+    validate(need(!is.null(df) && nrow(df) > 0 && "GSL_UWI_Std" %in% names(df),
+                  "No wells available under current filters."))
+
+    uwis <- unique(na.omit(df$GSL_UWI_Std))
+    ds <- compute_gor_timeseries_for_wells(
+      uwis,
+      input$well_date_filter[1],
+      input$well_date_filter[2],
+      include_cnd = isTRUE(input$gor_include_cnd)
+    )
+    validate(need(nrow(ds) > 0, "No production rows in selected date range."))
+    ds
+  })
+
   # Initial population of pickers (non-cascading)
   observe({
     req(wells_sf_global, nrow(wells_sf_global) > 0)
@@ -2008,7 +2133,7 @@ server <- function(input, output, session) {
       analysis_data <- filtered_group_cumulative_data()
       req(analysis_data, analysis_data$table_data)
       data_dl <- copy(analysis_data$table_data)
-      
+
       if(!is.null(data_dl) && nrow(data_dl) > 0) {
         breakout_col_r_name <- input$filtered_group_breakout_by # Original R name
         breakout_col_dl_name_map <- c("OperatorName" = "Group_By_Operator",
@@ -2018,21 +2143,75 @@ server <- function(input, output, session) {
                                       "FirstProdYear" = "Group_By_First_Prod_Year")
         breakout_col_dl_name <- breakout_col_dl_name_map[breakout_col_r_name]
         if(is.na(breakout_col_dl_name)) breakout_col_dl_name <- breakout_col_r_name
-        
-        
+
+
         old_dl_names <- c("PROD_DATE", breakout_col_r_name, "TotalMonthlyBOE", "AvgDailyBOE", "AvgDailyBOE_per_1000ft", "CumTotalMonthlyBOE", "TotalSumLateralLength")
         new_dl_names <- c("Prod_Month", breakout_col_dl_name, "Total_Monthly_BOE", "Avg_Daily_BOE", "Avg_Daily_BOE_per_1000ft", "Cumulative_BOE", "Sum_Producing_Lateral_Length_ft")
-        
+
         # Ensure only existing columns are attempted to be renamed
         current_dl_names <- names(data_dl)
         valid_old_dl_names <- old_dl_names[old_dl_names %in% current_dl_names]
         valid_new_dl_names <- new_dl_names[match(valid_old_dl_names, old_dl_names)]
-        
+
         if(length(valid_old_dl_names) > 0) {
           setnames(data_dl, old = valid_old_dl_names, new = valid_new_dl_names, skip_absent = TRUE)
         }
         fwrite(data_dl, file)
       } else { fwrite(data.table(Message="No data for download."), file) }
+    }
+  )
+
+  output$gor_trend_by_month_plot <- renderPlot({
+    ds <- gor_data_filtered()
+    grp_col <- if ("Formation" %in% names(reactive_vals$wells_to_display)) "Formation" else "OperatorName"
+    wells_meta <- data.table::as.data.table(sf::st_drop_geometry(reactive_vals$wells_to_display))[, .(GSL_UWI_Std, Formation = get(grp_col, ifnotfound = NA), OperatorName)]
+    ds <- merge(ds, unique(wells_meta), by = "GSL_UWI_Std", all.x = TRUE)
+
+    capd <- cap_gor_for_plot(ds$GOR_MCF_PER_BBL)
+    ds[, GOR_for_plot := capd$vals]
+
+    agg <- ds[, .(AvgGOR = median(GOR_for_plot, na.rm = TRUE)), by = .(Group = ifelse(!is.na(Formation) & Formation!="", Formation, OperatorName), MonthOnProd)]
+    agg <- agg[!is.na(MonthOnProd)]
+    ggplot(agg, aes(MonthOnProd, AvgGOR, color = Group)) +
+      geom_line(linewidth = 1) +
+      scale_y_continuous("Average GOR (MCF/BBL)", labels = scales::comma) +
+      scale_x_continuous("Month on production", breaks = pretty(agg$MonthOnProd)) +
+      guides(color = guide_legend(title = grp_col)) +
+      labs(subtitle = "∞ GOR values shown at capped level for readability") +
+      theme_minimal()
+  })
+
+  output$gas_weighting_by_vintage_plot <- renderPlot({
+    ds <- gor_data_filtered()
+    dsw <- ds[is.finite(GasWeighting) & GasWeighting >= 0 & GasWeighting <= 1]
+    validate(need(nrow(dsw) > 0, "No valid GasWeighting values."))
+
+    agg <- dsw[, .(AvgGW = mean(GasWeighting, na.rm = TRUE)), by = .(VintageYear, YearOnProd)]
+    ggplot(agg, aes(YearOnProd, AvgGW, color = factor(VintageYear))) +
+      geom_line(linewidth = 1) +
+      scale_y_continuous("Gas proportion of total production", labels = scales::percent, limits = c(0,1)) +
+      scale_x_continuous("Year on production", breaks = pretty(agg$YearOnProd)) +
+      guides(color = guide_legend(title = "Vintage")) +
+      theme_minimal()
+  })
+
+  output$gor_timeseries_table <- DT::renderDataTable({
+    ds <- gor_data_filtered()
+    show <- ds[, .(
+      GSL_UWI_Std, Month = PROD_DATE,
+      OilBBL, CndBBL, GasMCF, LiquidsBBL,
+      `GOR (MCF/BBL)` = GOR_MCF_PER_BBL,
+      `Gas weighting` = GasWeighting,
+      MonthOnProd, YearOnProd, VintageYear
+    )]
+    DT::datatable(show, options = list(pageLength = 25, scrollX = TRUE), rownames = FALSE)
+  })
+
+  output$download_gor_timeseries_csv <- downloadHandler(
+    filename = function() paste0("gor_timeseries_", Sys.Date(), ".csv"),
+    content = function(file) {
+      ds <- gor_data_filtered()
+      data.table::fwrite(ds, file)
     }
   )
   
