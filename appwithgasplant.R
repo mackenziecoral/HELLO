@@ -1077,6 +1077,30 @@ ui <- fluidPage(
 server <- function(input, output, session) {
   
   wells_sf <- wells_sf_global
+
+  # --- Helper: get operator choices with fallbacks & "(Unknown)" ---
+  get_operator_choices <- function(sf_obj) {
+    if (is.null(sf_obj) || !inherits(sf_obj, "sf") || nrow(sf_obj) == 0) return(character(0))
+    op <- trimws(as.character(sf::st_drop_geometry(sf_obj)$OperatorName))
+    # fallback to Excel join names if OperatorName mostly NA
+    if (all(is.na(op) | op == "")) {
+      if ("OperatorNameDisplay" %in% names(sf_obj)) {
+        op <- trimws(as.character(sf_obj$OperatorNameDisplay))
+      }
+    }
+    # fallback to any alternative columns already in the file
+    if (all(is.na(op) | op == "") && "Operator" %in% names(sf_obj)) {
+      op <- trimws(as.character(sf_obj$Operator))
+    }
+    has_unknown <- any(is.na(op) | op == "" | op == "NA")
+    op <- op[!is.na(op) & op != "" & op != "NA"]
+    op <- sort(unique(op))
+    if (has_unknown) {
+      op <- unique(c(op, "(Unknown)"))
+    }
+    if (!length(op)) op <- "(Unknown)"
+    op
+  }
   play_subplay_layers_list <- play_subplay_layers_list_global
   company_layers_list <- company_layers_list_global
   
@@ -1163,8 +1187,7 @@ server <- function(input, output, session) {
       if (!is.numeric(out[[col]])) out[, (col) := as.numeric(get(col))]
       out[is.na(get(col)), (col) := 0]
     }
-    include_cnd_flag <- isTRUE(use_cnd)
-    out[, LiquidsBBL := OilBBL + if (isTRUE(include_cnd_flag)) CndBBL else 0]
+    out[, LiquidsBBL := OilBBL + if (isTRUE(use_cnd)) CndBBL else 0]
     out[, GOR_MCF_PER_BBL := data.table::fifelse(
       LiquidsBBL > 0, GasMCF / LiquidsBBL,
       data.table::fifelse(GasMCF > 0, Inf, NA_real_)
@@ -1246,9 +1269,9 @@ server <- function(input, output, session) {
     m[is.na(m)] <- 0
 
     m[, LiquidsBBL := OilBBL + if (isTRUE(include_cnd)) CndBBL else 0]
-    m[, GOR_MCF_PER_BBL := fifelse(LiquidsBBL > 0, GasMCF/LiquidsBBL,
-                                   fifelse(GasMCF > 0, Inf, NA_real_))]
-    m[, GasWeighting := fifelse((GasMCF + LiquidsBBL) > 0, GasMCF/(GasMCF + LiquidsBBL), NA_real_)]
+    m[, GOR_MCF_PER_BBL := data.table::fifelse(LiquidsBBL > 0, GasMCF/LiquidsBBL,
+                                   data.table::fifelse(GasMCF > 0, Inf, NA_real_))]
+    m[, GasWeighting := data.table::fifelse((GasMCF + LiquidsBBL) > 0, GasMCF/(GasMCF + LiquidsBBL), NA_real_)]
 
     m <- m[order(GSL_UWI_STD, PROD_DATE)]
     first_prod <- m[(GasMCF + LiquidsBBL) > 0, .(FirstMonth = min(PROD_DATE)), by = GSL_UWI_STD]
@@ -1260,11 +1283,12 @@ server <- function(input, output, session) {
     m[]
   }
 
+  # Cap Inf/huge GOR values for plotting only
   cap_gor_for_plot <- function(x) {
     x_num <- suppressWarnings(as.numeric(x))
     finite <- is.finite(x_num)
     if (!any(finite)) return(list(vals = rep(NA_real_, length(x_num)), cap = NA_real_))
-    cap <- stats::quantile(x_num[finite], probs = 0.99, na.rm = TRUE, type = 7)
+    cap <- stats::quantile(x_num[finite], probs = 0.99, na.rm = TRUE)
     if (!is.finite(cap) || is.na(cap) || cap <= 0) cap <- max(x_num[finite], na.rm = TRUE)
     if (!is.finite(cap) || is.na(cap) || cap <= 0) cap <- 1
     x_cap <- x_num
@@ -1273,22 +1297,16 @@ server <- function(input, output, session) {
     list(vals = x_cap, cap = cap)
   }
 
-  safe_gor_palette <- function(x, n = 7) {
+  # Palette that never generates duplicate breaks
+  safe_palette <- function(x, n = 7) {
     dom <- x[is.finite(x)]
-    if (!length(dom)) {
-      return(leaflet::colorNumeric("viridis", domain = c(0, 1)))
+    if (length(dom) < 2 || diff(range(dom)) <= .Machine$double.eps) {
+      return(leaflet::colorNumeric("viridis", domain = range(dom %||% c(0,1), na.rm = TRUE)))
     }
-    rng <- range(dom, na.rm = TRUE)
-    if (diff(rng) <= .Machine$double.eps) {
-      return(leaflet::colorNumeric("viridis", domain = rng))
-    }
-    qs <- stats::quantile(dom, probs = seq(0, 1, length.out = n + 1), na.rm = TRUE, type = 7)
+    qs <- stats::quantile(dom, probs = seq(0, 1, length.out = n + 1), na.rm = TRUE)
     if (length(unique(as.numeric(qs))) <= 2) {
-      brks <- sort(unique(pretty(rng, n = n)))
-      brks <- brks[is.finite(brks)]
-      if (length(brks) < 3 || any(diff(brks) <= 0)) {
-        return(leaflet::colorNumeric("viridis", domain = rng))
-      }
+      brks <- unique(pretty(range(dom, na.rm = TRUE), n = n))
+      if (length(brks) < 3) return(leaflet::colorNumeric("viridis", domain = range(dom, na.rm = TRUE)))
       return(leaflet::colorBin("viridis", domain = dom, bins = brks, pretty = FALSE))
     }
     leaflet::colorQuantile("viridis", domain = dom, n = n)
@@ -1423,16 +1441,42 @@ server <- function(input, output, session) {
     req(wells_sf_global, nrow(wells_sf_global) > 0)
     message("SERVER OBSERVE (Initial Picker Population & Date Slider Range): Entered observer.")
     
-    op_choices_init <- prepare_filter_choices(wells_sf_global$OperatorName, "OperatorName (initial)")
+    op_choices_init <- get_operator_choices(wells_sf_global)
+    if (length(op_choices_init) == 1 && identical(op_choices_init, "(Unknown)")) {
+      showNotification("No operator values available for this dataset.", type = "warning", duration = 5)
+    }
     form_choices_init <- prepare_filter_choices(wells_sf_global$Formation, "Formation (initial)")
     fld_choices_init <- prepare_filter_choices(wells_sf_global$FieldName, "FieldName (initial)")
     prov_choices_init <- prepare_filter_choices(wells_sf_global$ProvinceState, "ProvinceState (initial)")
-    
-    updatePickerInput(session, "operator_filter", choices = if(length(op_choices_init)>0) op_choices_init else c("No Operators Found" = ""), selected = NULL)
-    updatePickerInput(session, "group_operator_filter", choices = if(length(op_choices_init)>0) op_choices_init else c("No Operators Found" = ""), selected = NULL)
-    updatePickerInput(session, "formation_filter", choices = if(length(form_choices_init)>0) form_choices_init else c("No Formations Found" = ""), selected = NULL)
-    updatePickerInput(session, "field_filter", choices = if(length(fld_choices_init)>0) fld_choices_init else c("No Fields Found" = ""), selected = NULL)
-    updatePickerInput(session, "province_filter", choices = if(length(prov_choices_init)>0) prov_choices_init else c("No Provinces Found" = ""), selected = NULL)
+
+    if (!length(form_choices_init)) {
+      form_choices_init <- "(Unknown)"
+      showNotification("No values available for Formation filter under current selections.", type = "warning", duration = 5)
+    }
+    if (!length(fld_choices_init)) {
+      fld_choices_init <- "(Unknown)"
+      showNotification("No values available for Field filter under current selections.", type = "warning", duration = 5)
+    }
+    if (!length(prov_choices_init)) {
+      prov_choices_init <- "(Unknown)"
+      showNotification("No values available for Province filter under current selections.", type = "warning", duration = 5)
+    }
+
+    updatePickerInput(session, "operator_filter",
+                      choices = op_choices_init,
+                      selected = NULL)
+    updatePickerInput(session, "group_operator_filter",
+                      choices = op_choices_init,
+                      selected = NULL)
+    updatePickerInput(session, "formation_filter",
+                      choices = form_choices_init,
+                      selected = NULL)
+    updatePickerInput(session, "field_filter",
+                      choices = fld_choices_init,
+                      selected = NULL)
+    updatePickerInput(session, "province_filter",
+                      choices = prov_choices_init,
+                      selected = NULL)
     
     updatePickerInput(session, "play_subplay_filter",
                       choices = if(length(initial_play_subplay_layer_names)>0) initial_play_subplay_layer_names else c("No Layers Loaded" = ""),
@@ -1763,9 +1807,9 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$update_map, {
-    req(wells_sf)
+    req(wells_sf_global)
     showNotification("Applying filters and updating map...", type = "message", id="mapUpdateMsg", duration = NULL)
-    if (is.null(wells_sf) || !inherits(wells_sf, "sf")) {
+    if (is.null(wells_sf_global) || !inherits(wells_sf_global, "sf")) {
       reactive_vals$wells_to_display <- sf::st_sf(geometry = sf::st_sfc(), crs = 4326)
       reactive_vals$wells_filtered_base <- sf::st_sf(geometry = sf::st_sfc(), crs = 4326)
       reactive_vals$map_df_with_gor <- sf::st_sf(geometry = sf::st_sfc(), crs = 4326)
@@ -1774,7 +1818,7 @@ server <- function(input, output, session) {
       showNotification("Well data source is not available.", type="error", duration=3)
       return()
     }
-    df <- wells_sf
+    df <- wells_sf_global
     if (nrow(df) == 0) {
       reactive_vals$wells_to_display <- sf::st_sf(geometry = sf::st_sfc(), crs = 4326)
       reactive_vals$wells_filtered_base <- sf::st_sf(geometry = sf::st_sfc(), crs = 4326)
@@ -1784,35 +1828,51 @@ server <- function(input, output, session) {
       showNotification("No well data available to filter.", type="warning", duration=3)
       return()
     }
-    current_operator_filter <- input$operator_filter[!input$operator_filter %in% c("", "Loading...", "No Operators Found", "No Well Data")]
-    current_formation_filter <- input$formation_filter[!input$formation_filter %in% c("", "Loading...", "No Formations Found", "No Well Data")]
-    current_field_filter <- input$field_filter[!input$field_filter %in% c("", "Loading...", "No Fields Found", "No Well Data")]
-    current_province_filter <- input$province_filter[!input$province_filter %in% c("", "Loading...", "No Provinces Found", "No Well Data")]
-    
-    current_date_filter_start <- input$well_date_filter[1]
-    current_date_filter_end <- input$well_date_filter[2]
-    
-    if (length(current_operator_filter) > 0) {
-      if ("OperatorName" %in% names(df)) df <- df %>% filter(OperatorName %in% current_operator_filter)
-    }
-    if (length(current_formation_filter) > 0) {
-      if ("Formation" %in% names(df)) df <- df %>% filter(Formation %in% current_formation_filter)
-    }
-    if (length(current_field_filter) > 0) {
-      if ("FieldName" %in% names(df)) df <- df %>% filter(FieldName %in% current_field_filter)
-    }
-    if (length(current_province_filter) > 0) {
-      if ("ProvinceState" %in% names(df)) df <- df %>% filter(ProvinceState %in% current_province_filter)
-    }
-    if ("FirstProdDate" %in% names(df) && inherits(df$FirstProdDate, "Date")) {
-      if (!is.na(current_date_filter_start) && !is.na(current_date_filter_end)) {
-        df <- df %>% filter(FirstProdDate >= current_date_filter_start & FirstProdDate <= current_date_filter_end)
+
+    # Operator
+    if (!is.null(input$operator_filter) && length(input$operator_filter) > 0 && "OperatorName" %in% names(df)) {
+      if ("(Unknown)" %in% input$operator_filter) {
+        df <- df %>% dplyr::filter(is.na(OperatorName) | OperatorName == "" | OperatorName %in% setdiff(input$operator_filter, "(Unknown)"))
       } else {
-        message("Date filter not applied as start or end date is NA.")
+        df <- df %>% dplyr::filter(!is.na(OperatorName) & OperatorName %in% input$operator_filter)
       }
-    } else {
-      message("FirstProdDate column not found or not Date type, skipping date filter.")
     }
+
+    # Formation
+    if (!is.null(input$formation_filter) && length(input$formation_filter) > 0 && "Formation" %in% names(df)) {
+      df <- df %>% dplyr::filter(!is.na(Formation) & Formation %in% input$formation_filter)
+    }
+
+    # Field
+    if (!is.null(input$field_filter) && length(input$field_filter) > 0 && "FieldName" %in% names(df)) {
+      df <- df %>% dplyr::filter(!is.na(FieldName) & FieldName %in% input$field_filter)
+    }
+
+    # Province/State
+    if (!is.null(input$province_filter) && length(input$province_filter) > 0 && "ProvinceState" %in% names(df)) {
+      df <- df %>% dplyr::filter(!is.na(ProvinceState) & ProvinceState %in% input$province_filter)
+    }
+
+    # Date range (FirstProdDate)
+    if (!is.null(input$well_date_filter) && length(input$well_date_filter) == 2 &&
+        "FirstProdDate" %in% names(df) && inherits(df$FirstProdDate, "Date")) {
+      df <- df %>% dplyr::filter(!is.na(FirstProdDate) &
+                                  FirstProdDate >= as.Date(input$well_date_filter[1]) &
+                                  FirstProdDate <= as.Date(input$well_date_filter[2]))
+    }
+
+    if (nrow(df) == 0) {
+      reactive_vals$wells_filtered_base <- df
+      reactive_vals$map_df_with_gor <- df
+      reactive_vals$wells_to_display <- df
+      reactive_vals$has_map_been_updated_once <- TRUE
+      leafletProxy("well_map") %>% clearMarkers() %>% clearControls()
+      update_well_selection_choices(df)
+      output$well_count_display <- renderUI({ HTML("0 wells match the current filters.") })
+      removeNotification("mapUpdateMsg")
+      return(invisible(NULL))
+    }
+
     reactive_vals$wells_filtered_base <- df
     df_with_gor <- compute_map_with_gor(df)
     reactive_vals$wells_to_display <- df_with_gor
@@ -1970,13 +2030,9 @@ server <- function(input, output, session) {
 
       capd <- cap_gor_for_plot(df_map$GOR_Latest)
       gor_for_color <- capd$vals
-      pal_gor <- safe_gor_palette(gor_for_color, n = 7)
-      color_mask <- is.finite(gor_for_color)
-      color_mask[is.na(color_mask)] <- FALSE
-      df_map$GOR_Color <- rep("#9E9E9E", nrow(df_map))
-      if (any(color_mask)) {
-        df_map$GOR_Color[color_mask] <- pal_gor(gor_for_color[color_mask])
-      }
+      pal <- safe_palette(gor_for_color, n = 7)
+      df_map$GOR_Color <- ifelse(is.finite(gor_for_color), pal(gor_for_color), "#9E9E9E")
+      df_map$GOR_Color[is.na(df_map$GOR_Color)] <- "#9E9E9E"
       df_map$GOR_Capped_ForColor <- gor_for_color
 
       well_layer_id_col_name <- if (!"GSL_UWI_Std" %in% names(df_map) || !is.character(df_map$GSL_UWI_Std)) {
@@ -2088,7 +2144,7 @@ server <- function(input, output, session) {
       } else {
         proxy %>% addLegend(
           position = "bottomright",
-          pal = pal_gor,
+          pal = pal,
           values = dom,
           title = htmltools::HTML("GOR (MCF/BBL)<br/><span style='font-weight:400'>(∞ shown at cap)</span>"),
           opacity = 0.9,
@@ -2599,10 +2655,19 @@ server <- function(input, output, session) {
   
   gor_data_filtered <- reactive({
     df <- reactive_vals$wells_to_display
-    validate(need(!is.null(df) && nrow(df) > 0 && "GSL_UWI_Std" %in% names(df),
-                  "No wells available under current filters."))
+    if (is.null(df) || nrow(df) == 0 || !"GSL_UWI_Std" %in% names(df)) {
+      empty <- data.table::data.table()
+      attr(empty, "empty_reason") <- "No wells in current filter."
+      return(empty)
+    }
 
     uwis <- unique(na.omit(df$GSL_UWI_Std))
+    if (!length(uwis)) {
+      empty <- data.table::data.table()
+      attr(empty, "empty_reason") <- "No wells in current filter."
+      return(empty)
+    }
+
     dr <- input$well_date_filter
     date_start <- if (!is.null(dr) && length(dr) >= 1) dr[1] else as.Date("1900-01-01")
     date_end <- if (!is.null(dr) && length(dr) >= 2) dr[2] else Sys.Date()
@@ -2612,12 +2677,16 @@ server <- function(input, output, session) {
       date_end,
       include_cnd = isTRUE(input$gor_include_cnd)
     )
-    validate(need(nrow(ds) > 0, "No production rows in selected date range."))
+    if (nrow(ds) == 0) {
+      attr(ds, "empty_reason") <- "No production rows in selected date range."
+    }
     ds
   })
 
   output$gor_trend_by_month_plot <- renderPlot({
     ds <- gor_data_filtered()
+    reason <- attr(ds, "empty_reason")
+    validate(need(nrow(ds) > 0, reason %||% "No wells in current filter."))
     grp_col <- if ("Formation" %in% names(reactive_vals$wells_to_display)) "Formation" else "OperatorName"
     wells_meta <- as.data.table(sf::st_drop_geometry(reactive_vals$wells_to_display))[, .(GSL_UWI_Std, Formation = get(grp_col, ifnotfound = NA), OperatorName)]
     ds <- merge(ds, unique(wells_meta), by = "GSL_UWI_Std", all.x = TRUE)
@@ -2638,6 +2707,8 @@ server <- function(input, output, session) {
 
   output$gas_weighting_by_vintage_plot <- renderPlot({
     ds <- gor_data_filtered()
+    reason <- attr(ds, "empty_reason")
+    validate(need(nrow(ds) > 0, reason %||% "No wells in current filter."))
     dsw <- ds[is.finite(GasWeighting) & GasWeighting >= 0 & GasWeighting <= 1]
     validate(need(nrow(dsw) > 0, "No valid GasWeighting values."))
 
@@ -2652,6 +2723,8 @@ server <- function(input, output, session) {
 
   output$gor_timeseries_table <- DT::renderDataTable({
     ds <- gor_data_filtered()
+    reason <- attr(ds, "empty_reason")
+    validate(need(nrow(ds) > 0, reason %||% "No wells in current filter."))
     show <- ds[, .(
       GSL_UWI_Std, Month = PROD_DATE,
       OilBBL, CndBBL, GasMCF, LiquidsBBL,
@@ -2666,6 +2739,11 @@ server <- function(input, output, session) {
     filename = function() paste0("gor_timeseries_", Sys.Date(), ".csv"),
     content = function(file) {
       ds <- gor_data_filtered()
+      if (nrow(ds) == 0) {
+        reason <- attr(ds, "empty_reason")
+        data.table::fwrite(data.table::data.table(Message = reason %||% "No wells in current filter."), file)
+        return()
+      }
       data.table::fwrite(ds, file)
     }
   )
