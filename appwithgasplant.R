@@ -1993,65 +1993,88 @@ server <- function(input, output, session) {
       capd <- cap_gor_for_plot(df_map$GOR_Latest)
       gor_for_color <- capd$vals
       pal_gor <- safe_palette(gor_for_color, n = 7)
-      df_map$GOR_Color <- ifelse(is.finite(gor_for_color), pal_gor(gor_for_color), "#9E9E9E")
+
+      finite_mask <- !is.na(gor_for_color) & is.finite(gor_for_color)
+      color_vec <- rep("#9E9E9E", length(gor_for_color))
+      if (any(finite_mask)) {
+        color_vec[finite_mask] <- pal_gor(gor_for_color[finite_mask])
+      }
+
+      df_map$GOR_Color <- color_vec
       df_map$GOR_Capped_ForColor <- gor_for_color
 
-      well_layer_id_col_name <- if (!"GSL_UWI_Std" %in% names(df_map) || !is.character(df_map$GSL_UWI_Std)) {
-        df_map$GSL_UWI_Std_for_map <- paste0("wellmarker_", seq_len(nrow(df_map)))
+      has_surface_lon <- "SurfaceLongitude" %in% names(df_map)
+      has_surface_lat <- "SurfaceLatitude" %in% names(df_map)
+      lon_vals <- if (has_surface_lon) suppressWarnings(as.numeric(df_map$SurfaceLongitude)) else rep(NA_real_, nrow(df_map))
+      lat_vals <- if (has_surface_lat) suppressWarnings(as.numeric(df_map$SurfaceLatitude)) else rep(NA_real_, nrow(df_map))
+
+      valid_coords <- !is.na(lon_vals) & !is.na(lat_vals) &
+        is.finite(lon_vals) & is.finite(lat_vals)
+
+      if (!any(valid_coords)) {
+        message("[MAP] No wells with valid surface coordinates after filtering; map markers skipped.")
+      }
+
+      df_map_valid <- df_map[valid_coords, , drop = FALSE]
+      lon_valid <- lon_vals[valid_coords]
+      lat_valid <- lat_vals[valid_coords]
+
+      well_layer_id_col_name <- if (!"GSL_UWI_Std" %in% names(df_map_valid) || !is.character(df_map_valid$GSL_UWI_Std)) {
+        df_map_valid$GSL_UWI_Std_for_map <- paste0("wellmarker_", seq_len(nrow(df_map_valid)))
         "GSL_UWI_Std_for_map"
       } else { "GSL_UWI_Std" }
 
       base_popup <- paste0(
-        "<b>UWI:</b> ", htmltools::htmlEscape(df_map$UWI), "<br>",
-        "<b>Well Name:</b> ", htmltools::htmlEscape(df_map$WellName), "<br>",
-        "<b>Operator:</b> ", htmltools::htmlEscape(df_map$OperatorName), "<br>",
-        "<b>Formation:</b> ", htmltools::htmlEscape(df_map$Formation), "<br>",
-        "<b>Field:</b> ", htmltools::htmlEscape(df_map$FieldName), "<br>",
-        "<b>Status:</b> ", htmltools::htmlEscape(df_map$CurrentStatus), "<br>",
-        "<b>First Prod Date:</b> ", htmltools::htmlEscape(as.character(df_map$FirstProdDate))
+        "<b>UWI:</b> ", htmltools::htmlEscape(df_map_valid$UWI), "<br>",
+        "<b>Well Name:</b> ", htmltools::htmlEscape(df_map_valid$WellName), "<br>",
+        "<b>Operator:</b> ", htmltools::htmlEscape(df_map_valid$OperatorName), "<br>",
+        "<b>Formation:</b> ", htmltools::htmlEscape(df_map_valid$Formation), "<br>",
+        "<b>Field:</b> ", htmltools::htmlEscape(df_map_valid$FieldName), "<br>",
+        "<b>Status:</b> ", htmltools::htmlEscape(df_map_valid$CurrentStatus), "<br>",
+        "<b>First Prod Date:</b> ", htmltools::htmlEscape(as.character(df_map_valid$FirstProdDate))
       )
 
-      confidential_text_vec <- if ("ConfidentialType" %in% names(df_map)) {
-        ifelse(!is.na(df_map$ConfidentialType),
-               paste0("<br><b>Confidential:</b> ", htmltools::htmlEscape(df_map$ConfidentialType)),
+      confidential_text_vec <- if ("ConfidentialType" %in% names(df_map_valid)) {
+        ifelse(!is.na(df_map_valid$ConfidentialType),
+               paste0("<br><b>Confidential:</b> ", htmltools::htmlEscape(df_map_valid$ConfidentialType)),
                "")
-      } else { rep("", nrow(df_map)) }
+      } else { rep("", nrow(df_map_valid)) }
 
-      bh_lat_text_vec <- if ("BH_Latitude" %in% names(df_map)) {
-        ifelse(!is.na(df_map$BH_Latitude),
-               paste0("<br><b>BH Lat:</b> ", round(df_map$BH_Latitude, 5)),
+      bh_lat_text_vec <- if ("BH_Latitude" %in% names(df_map_valid)) {
+        ifelse(!is.na(df_map_valid$BH_Latitude),
+               paste0("<br><b>BH Lat:</b> ", round(df_map_valid$BH_Latitude, 5)),
                "")
-      } else { rep("", nrow(df_map)) }
+      } else { rep("", nrow(df_map_valid)) }
 
-      bh_lon_text_vec <- if ("BH_Longitude" %in% names(df_map)) {
-        ifelse(!is.na(df_map$BH_Longitude),
-               paste0("<br><b>BH Lon:</b> ", round(df_map$BH_Longitude, 5)),
+      bh_lon_text_vec <- if ("BH_Longitude" %in% names(df_map_valid)) {
+        ifelse(!is.na(df_map_valid$BH_Longitude),
+               paste0("<br><b>BH Lon:</b> ", round(df_map_valid$BH_Longitude, 5)),
                "")
-      } else { rep("", nrow(df_map)) }
+      } else { rep("", nrow(df_map_valid)) }
 
-      is_inf_vec <- is.infinite(df_map$GOR_Latest)
+      is_inf_vec <- is.infinite(df_map_valid$GOR_Latest)
       gor_value_text <- ifelse(is_inf_vec,
                                "100% gas (∞ GOR)",
-                               ifelse(is.finite(df_map$GOR_Latest),
-                                      paste0(scales::comma(round(df_map$GOR_Latest, 1)), " MCF/BBL"),
+                               ifelse(is.finite(df_map_valid$GOR_Latest),
+                                      paste0(scales::comma(round(df_map_valid$GOR_Latest, 1)), " MCF/BBL"),
                                       "NA"))
-      gor_month_text <- ifelse(!is.na(df_map$GOR_Latest_Month),
-                               format(df_map$GOR_Latest_Month, "%Y-%m"),
+      gor_month_text <- ifelse(!is.na(df_map_valid$GOR_Latest_Month),
+                               format(df_map_valid$GOR_Latest_Month, "%Y-%m"),
                                "—")
-      gas_text <- ifelse(!is.na(df_map$MonthlyGasMCF),
-                         scales::comma(round(df_map$MonthlyGasMCF, 0)),
+      gas_text <- ifelse(!is.na(df_map_valid$MonthlyGasMCF),
+                         scales::comma(round(df_map_valid$MonthlyGasMCF, 0)),
                          "NA")
-      oil_text <- ifelse(!is.na(df_map$MonthlyOilBBL),
-                         scales::comma(round(df_map$MonthlyOilBBL, 0)),
+      oil_text <- ifelse(!is.na(df_map_valid$MonthlyOilBBL),
+                         scales::comma(round(df_map_valid$MonthlyOilBBL, 0)),
                          "NA")
-      cnd_text <- ifelse(!is.na(df_map$MonthlyCndBBL),
-                         scales::comma(round(df_map$MonthlyCndBBL, 0)),
+      cnd_text <- ifelse(!is.na(df_map_valid$MonthlyCndBBL),
+                         scales::comma(round(df_map_valid$MonthlyCndBBL, 0)),
                          "NA")
-      liquids_text <- ifelse(!is.na(df_map$MonthlyLiquidsBBL),
-                             scales::comma(round(df_map$MonthlyLiquidsBBL, 0)),
+      liquids_text <- ifelse(!is.na(df_map_valid$MonthlyLiquidsBBL),
+                             scales::comma(round(df_map_valid$MonthlyLiquidsBBL, 0)),
                              "NA")
-      gas_weighting_text <- ifelse(!is.na(df_map$GasWeightingLatest),
-                                   scales::percent(df_map$GasWeightingLatest, accuracy = 0.1),
+      gas_weighting_text <- ifelse(!is.na(df_map_valid$GasWeightingLatest),
+                                   scales::percent(df_map_valid$GasWeightingLatest, accuracy = 0.1),
                                    "NA")
       cnd_line <- if (isTRUE(input$gor_include_cnd)) paste0("<br><b>Monthly Condensate (BBL):</b> ", cnd_text) else ""
       gor_popup <- paste0(
@@ -2066,30 +2089,33 @@ server <- function(input, output, session) {
 
       well_popup_content <- paste0(base_popup, confidential_text_vec, bh_lat_text_vec, bh_lon_text_vec, gor_popup)
 
-      proxy %>% addCircleMarkers(
-        lng = df_map$SurfaceLongitude,
-        lat = df_map$SurfaceLatitude,
-        radius = 6,
-        color = df_map$GOR_Color,
-        fillColor = df_map$GOR_Color,
-        stroke = FALSE,
-        fillOpacity = 0.85,
-        popup = lapply(well_popup_content, htmltools::HTML),
-        layerId = df_map[[well_layer_id_col_name]],
-        group = "Wells",
-        clusterOptions = markerClusterOptions(spiderfyOnMaxZoom = TRUE, showCoverageOnHover = TRUE, zoomToBoundsOnClick = TRUE)
-      )
+      if (nrow(df_map_valid) > 0) {
+        proxy %>% addCircleMarkers(
+          lng = lon_valid,
+          lat = lat_valid,
+          radius = 6,
+          color = df_map_valid$GOR_Color,
+          fillColor = df_map_valid$GOR_Color,
+          stroke = FALSE,
+          fillOpacity = 0.85,
+          popup = lapply(well_popup_content, htmltools::HTML),
+          layerId = df_map_valid[[well_layer_id_col_name]],
+          group = "Wells",
+          clusterOptions = markerClusterOptions(spiderfyOnMaxZoom = TRUE, showCoverageOnHover = TRUE, zoomToBoundsOnClick = TRUE)
+        )
+      }
 
-      wells_with_bh <- df_map[!is.na(df_map$BH_Latitude) & !is.na(df_map$BH_Longitude) &
-                                !is.na(df_map$SurfaceLatitude) & !is.na(df_map$SurfaceLongitude), ]
+      bh_lon_vals <- if ("BH_Longitude" %in% names(df_map_valid)) suppressWarnings(as.numeric(df_map_valid$BH_Longitude)) else rep(NA_real_, nrow(df_map_valid))
+      bh_lat_vals <- if ("BH_Latitude" %in% names(df_map_valid)) suppressWarnings(as.numeric(df_map_valid$BH_Latitude)) else rep(NA_real_, nrow(df_map_valid))
+      wells_with_bh_idx <- which(!is.na(bh_lat_vals) & !is.na(bh_lon_vals) & is.finite(bh_lat_vals) & is.finite(bh_lon_vals))
 
-      if (nrow(wells_with_bh) > 0) {
-        for (i in seq_len(nrow(wells_with_bh))) {
-          well_stick_data <- wells_with_bh[i, ]
+      if (length(wells_with_bh_idx) > 0) {
+        for (idx in wells_with_bh_idx) {
+          well_stick_data <- df_map_valid[idx, ]
           stick_color <- if (!is.null(well_stick_data$GOR_Color) && !is.na(well_stick_data$GOR_Color)) well_stick_data$GOR_Color else "#9E9E9E"
           proxy %>% addPolylines(
-            lng = c(well_stick_data$SurfaceLongitude, well_stick_data$BH_Longitude),
-            lat = c(well_stick_data$SurfaceLatitude, well_stick_data$BH_Latitude),
+            lng = c(lon_valid[idx], bh_lon_vals[idx]),
+            lat = c(lat_valid[idx], bh_lat_vals[idx]),
             layerId = paste0(well_stick_data[[well_layer_id_col_name]], "_stick"),
             color = stick_color,
             weight = 2,
@@ -2099,7 +2125,7 @@ server <- function(input, output, session) {
         }
       }
 
-      dom <- gor_for_color[is.finite(gor_for_color)]
+      dom <- gor_for_color[finite_mask & valid_coords]
       if (length(dom) > 0) {
         proxy %>% addLegend(
           position = "bottomright",
@@ -2113,7 +2139,6 @@ server <- function(input, output, session) {
         message("[GOR] No finite domain for legend; skipping legend.")
       }
     }
-    
     # Add Acreage Legend if any acreage layers are selected
     if (length(acreage_legend_labels) > 0) {
       proxy %>% addLegend(
