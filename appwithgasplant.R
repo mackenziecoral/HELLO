@@ -1026,6 +1026,27 @@ ui <- fluidPage(
                             leafletOutput("gp_map", height = "75vh"),
                             br(),
                             DT::DTOutput("gp_table")
+                   ),
+                   tabPanel("DUCs Over Time",
+                            fluidRow(
+                              column(4,
+                                     dateInput("duc_date_a", "Snapshot A", value = as.Date("2024-12-31")),
+                                     dateInput("duc_date_b", "Snapshot B", value = as.Date("2025-12-31")),
+                                     checkboxInput("duc_exclude_conf", "Exclude Confidential wells", TRUE),
+                                     pickerInput("duc_group_by", "Group by:",
+                                                 choices = c("Operator" = "OperatorName", "Formation" = "Formation",
+                                                             "Field" = "FieldName", "Province/State" = "ProvinceState"),
+                                                 selected = "OperatorName"),
+                                     actionButton("duc_apply", "Compute DUCs", class = "btn-primary")
+                              ),
+                              column(8,
+                                     h4(textOutput("duc_headline")),
+                                     plotlyOutput("duc_bar_compare", height = "45vh"),
+                                     br(),
+                                     downloadButton("duc_download", "Download DUC table (CSV)"),
+                                     DTOutput("duc_table")
+                              )
+                            )
                    )
                  )
         )
@@ -1070,11 +1091,17 @@ server <- function(input, output, session) {
     min_prod_date = as.Date("1900-01-01"),
     max_prod_date = Sys.Date(),
     min_first_prod_date_overall = as.Date("1900-01-01"),
-    max_first_prod_date_overall = Sys.Date()
+    max_first_prod_date_overall = Sys.Date(),
+    duc_comp = data.table::data.table()
   )
+
+  # --- PATCH 1A: safe boolean for "Oil + Condensate" toggle
+  use_cnd_reactive <- reactive({ isTRUE(input$gor_include_cnd) })
 
   fetch_monthly_gor <- function(uwi_vec, date_start, date_end, use_cnd = TRUE) {
     if (length(uwi_vec) == 0) return(data.table::data.table())
+
+    use_cnd <- isTRUE(use_cnd)
 
     if (is.null(con) || !DBI::dbIsValid(con)) {
       con <<- connect_to_db()
@@ -1144,10 +1171,9 @@ server <- function(input, output, session) {
       if (!is.numeric(out[[col]])) out[, (col) := as.numeric(get(col))]
       out[is.na(get(col)), (col) := 0]
     }
-    use_cnd <- isTRUE(include_cnd)
-    out[, LiquidsBBL := OilBBL + if (isTRUE(use_cnd)) CndBBL else 0]
-    out[, GOR_MCF_PER_BBL := data.table::fifelse(LiquidsBBL > 0, GasMCF / LiquidsBBL,
-                                                 data.table::fifelse(GasMCF > 0, Inf, NA_real_))]
+    out[, LiquidsBBL := OilBBL + if (use_cnd) CndBBL else 0]
+    out[, GOR_MCF_PER_BBL := data.table::fifelse(LiquidsBBL > 0, GasMCF / LiquidsBBL, NA_real_)]
+    out[!is.finite(GOR_MCF_PER_BBL) | GOR_MCF_PER_BBL < 0, GOR_MCF_PER_BBL := NA_real_]
     out[, GasWeighting := data.table::fifelse((GasMCF + LiquidsBBL) > 0, GasMCF / (GasMCF + LiquidsBBL), NA_real_)]
 
     data.table::setorder(out, GSL_UWI_STD, PROD_DATE)
@@ -1165,8 +1191,10 @@ server <- function(input, output, session) {
     latest[]
   }
 
-  compute_gor_timeseries_for_wells <- function(uwi_vec, date_start, date_end, include_cnd = TRUE) {
+  compute_gor_timeseries_for_wells <- function(uwi_vec, date_start, date_end, use_cnd = TRUE) {
     if (length(uwi_vec) == 0) return(data.table::data.table())
+
+    use_cnd <- isTRUE(use_cnd)
 
     if (is.null(con) || !DBI::dbIsValid(con)) {
       con <<- connect_to_db()
@@ -1241,9 +1269,9 @@ server <- function(input, output, session) {
       if (!is.numeric(out[[col]])) out[, (col) := as.numeric(get(col))]
       out[is.na(get(col)), (col) := 0]
     }
-    out[, LiquidsBBL := OilBBL + if (isTRUE(use_cnd)) CndBBL else 0]
-    out[, GOR_MCF_PER_BBL := data.table::fifelse(LiquidsBBL > 0, GasMCF / LiquidsBBL,
-                                                 data.table::fifelse(GasMCF > 0, Inf, NA_real_))]
+    out[, LiquidsBBL := OilBBL + if (use_cnd) CndBBL else 0]
+    out[, GOR_MCF_PER_BBL := data.table::fifelse(LiquidsBBL > 0, GasMCF / LiquidsBBL, NA_real_)]
+    out[!is.finite(GOR_MCF_PER_BBL) | GOR_MCF_PER_BBL < 0, GOR_MCF_PER_BBL := NA_real_]
     out[, GasWeighting := data.table::fifelse((GasMCF + LiquidsBBL) > 0, GasMCF / (GasMCF + LiquidsBBL), NA_real_)]
 
     data.table::setorder(out, GSL_UWI_STD, PROD_DATE)
@@ -1264,34 +1292,23 @@ server <- function(input, output, session) {
     list(vals = x_cap, cap = cap)
   }
 
-  # Palette that never generates duplicate breaks
-  safe_palette <- function(x, n = 7) {
-    dom <- x[is.finite(x)]
-    if (length(dom) < 2 || diff(range(dom)) <= .Machine$double.eps) {
-      return(leaflet::colorNumeric("viridis", domain = range(dom %||% c(0, 1), na.rm = TRUE)))
+  # --- PATCH 2: robust breaks for GOR
+  make_gor_palette <- function(gor_vec, n = 7) {
+    gor_vec <- as.numeric(gor_vec)
+    gor_vec <- gor_vec[is.finite(gor_vec) & gor_vec >= 0]
+    if (length(gor_vec) == 0L) {
+      return(leaflet::colorNumeric("viridis", domain = c(0, 1)))
     }
-    qs <- stats::quantile(dom, probs = seq(0, 1, length.out = n + 1), na.rm = TRUE)
-    qs_num <- as.numeric(qs)
-    unique_qs <- unique(qs_num)
-    if (length(unique_qs) <= 2) {
-      brks <- unique(pretty(range(dom, na.rm = TRUE), n = n))
-      brks <- sort(brks)
-      if (length(brks) < 3 || any(diff(brks) <= 0)) {
-        return(leaflet::colorNumeric("viridis", domain = range(dom, na.rm = TRUE)))
-      }
-      return(leaflet::colorBin("viridis", domain = dom, bins = brks, pretty = FALSE))
+    rng <- range(gor_vec, na.rm = TRUE)
+    if (diff(rng) <= .Machine$double.eps) {
+      rng[2] <- rng[1] + 1e-9
     }
-    if (length(unique_qs) < length(qs_num)) {
-      brks <- sort(unique(unique_qs))
-      if (length(brks) < 3 || any(diff(brks) <= 0)) {
-        return(leaflet::colorNumeric("viridis", domain = range(dom, na.rm = TRUE)))
-      }
-      return(leaflet::colorBin("viridis", domain = dom, bins = brks, pretty = FALSE))
+    br <- unique(as.numeric(stats::quantile(gor_vec, probs = seq(0, 1, length.out = n), na.rm = TRUE)))
+    br <- sort(unique(c(rng[1], br, rng[2])))
+    if (length(br) < 3L) {
+      br <- c(rng[1], rng[2] + 1e-9)
     }
-    tryCatch(
-      leaflet::colorQuantile("viridis", domain = dom, n = n),
-      error = function(...) leaflet::colorNumeric("viridis", domain = range(dom, na.rm = TRUE))
-    )
+    leaflet::colorBin("viridis", domain = gor_vec, bins = br, right = FALSE, na.color = "#9E9E9E")
   }
 
   compute_map_with_gor <- function(base_df) {
@@ -1324,9 +1341,7 @@ server <- function(input, output, session) {
     date_vals <- input$well_date_filter
     date_start <- if (!is.null(date_vals) && length(date_vals) >= 1) date_vals[1] else Sys.Date() - years(10)
     date_end <- if (!is.null(date_vals) && length(date_vals) >= 2) date_vals[2] else Sys.Date()
-    use_cnd <- isTRUE(input$gor_include_cnd)
-
-    gor_latest <- fetch_monthly_gor(map_uwis, date_start, date_end, use_cnd = use_cnd)
+    gor_latest <- fetch_monthly_gor(map_uwis, date_start, date_end, use_cnd = use_cnd_reactive())
 
     df_out$GOR_Latest <- NA_real_
     df_out$GOR_Latest_Month <- as.Date(NA)
@@ -1416,6 +1431,54 @@ server <- function(input, output, session) {
       updateSelectInput(session, "selected_well_for_prod", choices = well_choices_for_prod, selected = "")
       if (!is.null(current_selection) && current_selection != "") reactive_vals$current_selected_gsl_uwi_std <- NULL
     }
+  }
+
+  # --- PATCH 6B/6C: helpers for DUC calculations ---
+  is_duc_at <- function(dt, t, exclude_conf = TRUE) {
+    spud_ok <- !is.na(dt$SpudDate) & dt$SpudDate <= t
+    fpd_ok <- is.na(dt$FirstProdDate) | dt$FirstProdDate > t
+    abd_ok <- is.na(dt$AbandonmentDate) | dt$AbandonmentDate > t
+    conf_ok <- TRUE
+    if (exclude_conf && "ConfidentialType" %in% names(dt)) {
+      conf_vals <- dt$ConfidentialType
+      if (!is.character(conf_vals)) conf_vals <- as.character(conf_vals)
+      conf_ok <- is.na(conf_vals) | trimws(conf_vals) == ""
+    }
+    spud_ok & fpd_ok & abd_ok & conf_ok
+  }
+
+  duc_snapshot <- function(t_date, exclude_conf = TRUE) {
+    sfobj <- reactive_vals$wells_filtered_base
+    if (is.null(sfobj) || !inherits(sfobj, "sf") || nrow(sfobj) == 0) return(data.table::data.table())
+    dt <- data.table::as.data.table(sf::st_drop_geometry(sfobj))
+    needed <- c("SpudDate", "FirstProdDate", "AbandonmentDate")
+    if (!all(needed %in% names(dt))) return(data.table::data.table())
+    for (nm in needed) {
+      if (!inherits(dt[[nm]], "Date")) dt[, (nm) := as.Date(get(nm))]
+    }
+    if ("ConfidentialType" %in% names(dt) && !is.character(dt$ConfidentialType)) {
+      dt[, ConfidentialType := as.character(ConfidentialType)]
+    }
+    flags <- is_duc_at(dt, as.Date(t_date), exclude_conf = exclude_conf)
+    dt[flags]
+  }
+
+  safe_group_duc <- function(dt, grp) {
+    if (!nrow(dt) || is.null(grp)) {
+      return(data.table::data.table(Group = "(none)", DUCs = 0L))
+    }
+    grp <- as.character(grp)
+    if (!grp %in% names(dt)) {
+      return(data.table::data.table(Group = "(none)", DUCs = 0L))
+    }
+    tmp <- data.table::copy(dt)
+    tmp[, Group := {
+      vals <- get(grp)
+      if (!is.character(vals)) vals <- as.character(vals)
+      vals[is.na(vals) | trimws(vals) == ""] <- "(Unknown)"
+      vals
+    }]
+    tmp[, .(DUCs = .N), by = Group][order(-DUCs)]
   }
   
   # Initial population of pickers (non-cascading)
@@ -2008,9 +2071,10 @@ server <- function(input, output, session) {
 
       capd <- cap_gor_for_plot(df_map$GOR_Latest)
       gor_for_color <- capd$vals
-      pal_gor <- safe_palette(gor_for_color, n = 7)
+      gor_for_color[!is.finite(gor_for_color) | gor_for_color < 0] <- NA_real_
+      pal_gor <- make_gor_palette(gor_for_color, n = 7)
 
-      finite_mask <- !is.na(gor_for_color) & is.finite(gor_for_color)
+      finite_mask <- is.finite(gor_for_color) & gor_for_color >= 0
       color_vec <- rep("#9E9E9E", length(gor_for_color))
       if (any(finite_mask)) {
         color_vec[finite_mask] <- pal_gor(gor_for_color[finite_mask])
@@ -2068,12 +2132,10 @@ server <- function(input, output, session) {
                "")
       } else { rep("", nrow(df_map_valid)) }
 
-      is_inf_vec <- is.infinite(df_map_valid$GOR_Latest)
-      gor_value_text <- ifelse(is_inf_vec,
-                               "100% gas (∞ GOR)",
-                               ifelse(is.finite(df_map_valid$GOR_Latest),
-                                      paste0(scales::comma(round(df_map_valid$GOR_Latest, 1)), " MCF/BBL"),
-                                      "NA"))
+      finite_gor_latest <- is.finite(df_map_valid$GOR_Latest) & df_map_valid$GOR_Latest >= 0
+      gor_value_text <- ifelse(finite_gor_latest,
+                               paste0(scales::comma(round(df_map_valid$GOR_Latest, 1)), " MCF/BBL"),
+                               "NA")
       gor_month_text <- ifelse(!is.na(df_map_valid$GOR_Latest_Month),
                                format(df_map_valid$GOR_Latest_Month, "%Y-%m"),
                                "—")
@@ -2147,7 +2209,7 @@ server <- function(input, output, session) {
           position = "bottomright",
           pal = pal_gor,
           values = dom,
-          title = htmltools::HTML("GOR (MCF/BBL)<br/><span style='font-weight:400'>(∞ shown at cap)</span>"),
+          title = htmltools::HTML("GOR (MCF/BBL)"),
           opacity = 0.9,
           layerId = "gor_legend"
         )
@@ -2669,9 +2731,7 @@ server <- function(input, output, session) {
     date_vals <- input$well_date_filter
     date_start <- if (length(date_vals) >= 1) date_vals[1] else Sys.Date() - years(5)
     date_end <- if (length(date_vals) >= 2) date_vals[2] else Sys.Date()
-    include_cnd <- isTRUE(input$gor_include_cnd)
-
-    ts_dt <- compute_gor_timeseries_for_wells(uwis, date_start, date_end, include_cnd)
+    ts_dt <- compute_gor_timeseries_for_wells(uwis, date_start, date_end, use_cnd = use_cnd_reactive())
     if (nrow(ts_dt) == 0) return(ts_dt)
 
     data.table::setorder(ts_dt, GSL_UWI_STD, PROD_DATE)
@@ -2722,15 +2782,18 @@ server <- function(input, output, session) {
   })
 
   output$gor_trend_by_month_plot <- renderPlot({
-    ds <- gor_data_filtered()
-    validate(need(nrow(ds) > 0, "No wells in current filter."))
-    ds <- data.table::copy(ds)
+    ds <- data.table::copy(gor_data_filtered())
+    req(nrow(ds) > 0)
+    req(all(c("PROD_DATE", "GOR_MCF_PER_BBL", "MonthOnProduction") %in% names(ds)))
+
+    ds <- ds[is.finite(GOR_MCF_PER_BBL) & GOR_MCF_PER_BBL >= 0]
+    req(nrow(ds) > 0)
 
     capd <- cap_gor_for_plot(ds$GOR_MCF_PER_BBL)
     ds[, GOR_for_plot := capd$vals]
 
     plot_dt <- ds[!is.na(MonthOnProduction) & MonthOnProduction >= 1]
-    validate(need(nrow(plot_dt) > 0, "No production months available for GOR trend."))
+    req(nrow(plot_dt) > 0)
 
     if ("Formation" %in% names(plot_dt) && any(!is.na(plot_dt$Formation) & trimws(plot_dt$Formation) != "")) {
       plot_dt[, Group := ifelse(is.na(Formation) | trimws(Formation) == "", "(Unknown)", Formation)]
@@ -2747,7 +2810,7 @@ server <- function(input, output, session) {
       MedianGOR = if (all(is.na(GOR_for_plot))) NA_real_ else stats::median(GOR_for_plot, na.rm = TRUE)
     ), by = .(Group, MonthOnProduction)]
     agg <- agg[is.finite(MedianGOR)]
-    validate(need(nrow(agg) > 0, "No valid GOR data to plot."))
+    req(nrow(agg) > 0)
 
     unique_groups <- unique(agg$Group)
     group_colors <- custom_palette[1:min(length(unique_groups), length(custom_palette))]
@@ -2763,7 +2826,7 @@ server <- function(input, output, session) {
       scale_color_manual(values = group_colors) +
       labs(
         title = "Median GOR by month on production",
-        subtitle = "∞ shown at cap",
+        subtitle = "Values capped at p99 for visualization.",
         x = "Month on Production",
         y = "Median GOR (MCF/BBL)",
         color = color_label
@@ -2773,21 +2836,22 @@ server <- function(input, output, session) {
   })
 
   output$gas_weighting_by_vintage_plot <- renderPlot({
-    ds <- gor_data_filtered()
-    validate(need(nrow(ds) > 0, "No wells in current filter."))
+    ds <- data.table::copy(gor_data_filtered())
+    req(nrow(ds) > 0)
+    req("GasWeighting" %in% names(ds))
 
     dsw <- ds[is.finite(GasWeighting) & GasWeighting >= 0 & GasWeighting <= 1]
-    validate(need(nrow(dsw) > 0, "No valid GasWeighting values in range."))
+    req(nrow(dsw) > 0)
 
     plot_dt <- dsw[!is.na(VintageYear) & !is.na(YearOnProduction) & YearOnProduction >= 1]
-    validate(need(nrow(plot_dt) > 0, "No gas weighting data for current filters."))
+    req(nrow(plot_dt) > 0)
 
     plot_dt[, VintageYear := as.character(VintageYear)]
     agg <- plot_dt[, .(
       AvgGasWeighting = if (all(is.na(GasWeighting))) NA_real_ else mean(GasWeighting, na.rm = TRUE)
     ), by = .(VintageYear, YearOnProduction)]
     agg <- agg[is.finite(AvgGasWeighting)]
-    validate(need(nrow(agg) > 0, "No gas weighting data for current filters."))
+    req(nrow(agg) > 0)
 
     agg[, VintageYear := factor(VintageYear, levels = sort(unique(VintageYear)))]
     unique_vintages <- levels(agg$VintageYear)
@@ -2804,7 +2868,7 @@ server <- function(input, output, session) {
       scale_color_manual(values = vintage_colors) +
       labs(
         title = "Average gas weighting by vintage",
-        subtitle = "If LiquidsBBL = 0 & GasMCF > 0, weighting = 100%; if both 0, excluded.",
+        subtitle = "Only finite gas weighting values included.",
         x = "Year on Production",
         y = "Average Gas Weighting",
         color = "Vintage Year"
@@ -2814,16 +2878,16 @@ server <- function(input, output, session) {
   })
 
   output$gor_timeseries_table <- DT::renderDataTable({
-    ds <- gor_data_filtered()
-    validate(need(nrow(ds) > 0, "No wells in current filter."))
+    ds <- data.table::copy(gor_data_filtered())
+    req(nrow(ds) > 0)
 
     display <- data.table::copy(ds)
     display[, ProdMonth := format(PROD_DATE, "%Y-%m")]
     display[, WellDisplay := ifelse(!is.na(WellName) & trimws(WellName) != "", WellName, GSL_UWI_STD)]
     display[, `GOR (MCF/BBL)` := ifelse(
-      is.infinite(GOR_MCF_PER_BBL),
-      "Inf (100% gas)",
-      ifelse(is.na(GOR_MCF_PER_BBL), "NA", scales::comma(GOR_MCF_PER_BBL, accuracy = 0.1))
+      is.finite(GOR_MCF_PER_BBL) & GOR_MCF_PER_BBL >= 0,
+      scales::comma(GOR_MCF_PER_BBL, accuracy = 0.1),
+      "NA"
     )]
     display[, `Gas weighting (%)` := ifelse(
       is.na(GasWeighting),
@@ -2877,6 +2941,86 @@ server <- function(input, output, session) {
         names(export_dt)
       )
       data.table::fwrite(export_dt[, ..cols], file)
+    }
+  )
+
+  observeEvent(input$duc_apply, {
+    req(input$duc_date_a, input$duc_date_b)
+    snap_a <- as.Date(input$duc_date_a)
+    snap_b <- as.Date(input$duc_date_b)
+    exclude_conf <- isTRUE(input$duc_exclude_conf)
+    grp <- input$duc_group_by %||% "OperatorName"
+
+    A <- duc_snapshot(snap_a, exclude_conf = exclude_conf)
+    B <- duc_snapshot(snap_b, exclude_conf = exclude_conf)
+
+    gA <- safe_group_duc(A, grp)
+    gB <- safe_group_duc(B, grp)
+
+    if (nrow(gA)) {
+      data.table::setnames(gA, c("Group", "DUCs"), c("Group", "DUCs_A"))
+    } else {
+      gA <- data.table::data.table(Group = character(0), DUCs_A = integer(0))
+    }
+    if (nrow(gB)) {
+      data.table::setnames(gB, c("Group", "DUCs"), c("Group", "DUCs_B"))
+    } else {
+      gB <- data.table::data.table(Group = character(0), DUCs_B = integer(0))
+    }
+
+    comp <- merge(gA, gB, by = "Group", all = TRUE)
+    if (!nrow(comp)) {
+      comp <- data.table::data.table(Group = character(0), DUCs_A = integer(0), DUCs_B = integer(0), Delta = integer(0))
+    } else {
+      for (col in c("DUCs_A", "DUCs_B")) comp[is.na(get(col)), (col) := 0L]
+      comp[, Delta := as.integer(DUCs_B - DUCs_A)]
+      data.table::setorder(comp, -Delta, -DUCs_B)
+    }
+
+    reactive_vals$duc_comp <- comp
+  })
+
+  output$duc_headline <- renderText({
+    comp <- reactive_vals$duc_comp
+    req(is.data.frame(comp))
+    total_a <- sum(comp$DUCs_A %||% 0, na.rm = TRUE)
+    total_b <- sum(comp$DUCs_B %||% 0, na.rm = TRUE)
+    delta <- total_b - total_a
+    glue::glue("DUCs at {input$duc_date_a} vs {input$duc_date_b} — total Δ = {scales::comma(delta)} (B − A)")
+  })
+
+  output$duc_bar_compare <- plotly::renderPlotly({
+    comp <- reactive_vals$duc_comp
+    req(is.data.frame(comp), nrow(comp) > 0)
+    top_n <- min(25, nrow(comp))
+    plot_dt <- data.table::copy(comp[1:top_n])
+    plot_dt[, Group := factor(Group, levels = rev(Group))]
+    plt <- ggplot(plot_dt, aes(x = Group, y = Delta, text = paste0("Snapshot A: ", DUCs_A, "\nSnapshot B: ", DUCs_B))) +
+      geom_col(fill = "#3182bd") +
+      coord_flip() +
+      labs(x = NULL, y = "Change in DUCs (B − A)") +
+      theme_minimal(base_size = 12)
+    plotly::ggplotly(plt, tooltip = c("y", "text"))
+  })
+
+  output$duc_table <- DT::renderDT({
+    comp <- reactive_vals$duc_comp
+    req(is.data.frame(comp))
+    if (!nrow(comp)) {
+      return(DT::datatable(data.frame(Message = "No DUCs for selected snapshots."), options = list(searching = FALSE, paging = FALSE, info = FALSE), rownames = FALSE))
+    }
+    DT::datatable(comp, rownames = FALSE, options = list(pageLength = 25, scrollX = TRUE))
+  })
+
+  output$duc_download <- downloadHandler(
+    filename = function() sprintf("duc_compare_%s_vs_%s.csv", input$duc_date_a, input$duc_date_b),
+    content = function(file) {
+      comp <- reactive_vals$duc_comp
+      if (!is.data.frame(comp) || !nrow(comp)) {
+        data.table::fwrite(data.table::data.table(Message = "No DUC comparison available for download."), file)
+      } else {
+        data.table::fwrite(data.table::as.data.table(comp), file)
+      }
     }
   )
 
