@@ -1240,6 +1240,7 @@ server <- function(input, output, session) {
       if (!is.numeric(out[[col]])) out[, (col) := as.numeric(get(col))]
       out[is.na(get(col)), (col) := 0]
     }
+    use_cnd <- include_cnd
     out[, LiquidsBBL := OilBBL + if (isTRUE(use_cnd)) CndBBL else 0]
     out[, GOR_MCF_PER_BBL := data.table::fifelse(LiquidsBBL > 0, GasMCF / LiquidsBBL,
                                                  data.table::fifelse(GasMCF > 0, Inf, NA_real_))]
@@ -1270,8 +1271,15 @@ server <- function(input, output, session) {
       return(leaflet::colorNumeric("viridis", domain = range(dom %||% c(0,1), na.rm = TRUE)))
     }
     qs <- stats::quantile(dom, probs = seq(0, 1, length.out = n + 1), na.rm = TRUE)
-    if (length(unique(as.numeric(qs))) <= 2) {
+    qs_num <- as.numeric(qs)
+    unique_qs <- unique(qs_num)
+    if (length(unique_qs) <= 2) {
       brks <- unique(pretty(range(dom, na.rm = TRUE), n = n))
+      if (length(brks) < 3) return(leaflet::colorNumeric("viridis", domain = range(dom, na.rm = TRUE)))
+      return(leaflet::colorBin("viridis", domain = dom, bins = brks, pretty = FALSE))
+    }
+    if (length(unique_qs) < length(qs_num)) {
+      brks <- unique(sort(unique_qs))
       if (length(brks) < 3) return(leaflet::colorNumeric("viridis", domain = range(dom, na.rm = TRUE)))
       return(leaflet::colorBin("viridis", domain = dom, bins = brks, pretty = FALSE))
     }
