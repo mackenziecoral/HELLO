@@ -1052,31 +1052,64 @@ ui <- fluidPage(
                    ),
                    tabPanel("DUCs Over Time",
                             fluidRow(
-                              column(4,
-                                     shinyWidgets::airDatepickerInput(
-                                       inputId = "duc_dates",
-                                       label   = "Snapshot dates",
-                                       value   = c(as.Date("2024-12-31"), as.Date("2025-12-31")),
-                                       multiple = TRUE,
-                                       clearButton = TRUE
-                                     ),
-                                     checkboxInput("duc_exclude_conf", "Exclude Confidential wells", TRUE),
-                                     pickerInput("duc_group_by", "Group by:",
-                                                 choices = c("Operator" = "OperatorName", "Formation" = "Formation",
-                                                             "Field" = "FieldName", "Province/State" = "ProvinceState"),
-                                                 selected = "OperatorName"),
-                                     actionButton("duc_apply", "Compute DUCs", class = "btn-primary"),
-                                     shiny::wellPanel(
-                                       tags$strong("How DUCs are calculated in this tool"),
-                                       tags$ul(
-                                         tags$li("A well is a DUC at snapshot date D if:"),
-                                         tags$li("• SpudDate is not NA and SpudDate ≤ D;"),
-                                         tags$li("• FirstProdDate is NA OR FirstProdDate > D (i.e., not onstream yet at D);"),
-                                         tags$li("• AbandonmentDate is NA OR AbandonmentDate > D;"),
-                                         tags$li("• Optional: if 'Exclude Confidential wells' is checked, wells with ConfidentialType ≠ NA are excluded.")
-                                       ),
-                                       tags$small("Grouping (Operator / Formation / Field / Province) uses columns already present in the well master, joined per your current logic.")
-                                     )
+                              column(
+                                width = 4,
+
+                                shinyWidgets::airDatepickerInput(
+                                  inputId = "duc_dates",
+                                  label   = "Snapshot dates",
+                                  value   = c(as.Date("2024-12-31"), as.Date("2025-12-31")),
+                                  multiple = TRUE,
+                                  clearButton = TRUE
+                                ),
+
+                                sliderInput(
+                                  "duc_min_hold_days",
+                                  "Min days since spud to count as DUC",
+                                  min = 0,
+                                  max = 180,
+                                  value = 30,
+                                  step = 10
+                                ),
+
+                                checkboxInput(
+                                  "duc_exclude_conf",
+                                  "Exclude wells flagged Confidential",
+                                  value = TRUE
+                                ),
+
+                                selectInput(
+                                  "duc_group_by",
+                                  "Group DUC counts by",
+                                  choices = c(
+                                    "Operator"        = "OperatorName",
+                                    "Formation"       = "Formation",
+                                    "Field"           = "FieldName",
+                                    "Province/State"  = "ProvinceState"
+                                  ),
+                                  selected = "OperatorName"
+                                ),
+
+                                actionButton(
+                                  "duc_apply",
+                                  "Calculate DUCs",
+                                  class = "btn-primary"
+                                ),
+
+                                br(),
+                                wellPanel(
+                                  tags$strong("How this tool defines a DUC"),
+                                  tags$ul(
+                                    tags$li("Pick one or more Snapshot dates (month-end or any date)."),
+                                    tags$li("For each Snapshot date D, a well is counted as a DUC if:"),
+                                    tags$li("• SpudDate is not NA AND SpudDate ≤ D;"),
+                                    tags$li("• (FirstProdDate is NA) OR (FirstProdDate > D);"),
+                                    tags$li("• (AbandonmentDate is NA) OR (AbandonmentDate > D);"),
+                                    tags$li("• The well has been drilled for at least `Min days since spud` days by D (SpudDate ≤ D - N days);"),
+                                    tags$li("• If 'Exclude wells flagged Confidential' is checked, wells with ConfidentialType not empty are dropped.")
+                                  ),
+                                  tags$small("Counts are grouped by the selected dimension (Operator, Formation, Field, Province). The bar chart shows absolute DUC totals per snapshot date; not just deltas.")
+                                )
                               ),
                               column(8,
                                      h4(textOutput("duc_headline")),
@@ -1472,23 +1505,63 @@ server <- function(input, output, session) {
     }
   }
 
-  # --- DUC helpers ---
-  is_duc_at <- function(dt, snap_date, exclude_conf = TRUE) {
-    if (!nrow(dt)) return(logical(0))
+  # ---- DUC logic helpers ----
+
+  # Returns TRUE/FALSE vector telling whether each row is considered a DUC
+  is_duc_at <- function(dt, snap_date, min_hold_days = 30L, exclude_conf = TRUE) {
     d <- as.Date(snap_date)
-    spud <- as.Date(dt$SpudDate)
-    first_prod <- as.Date(dt$FirstProdDate)
-    abandon <- as.Date(dt$AbandonmentDate)
-    keep <- !is.na(spud) & spud <= d &
-      (is.na(first_prod) | first_prod > d) &
-      (is.na(abandon) | abandon > d)
+
+    # basic drilled-but-not-onstream tests
+    drilled_before_snap <- !is.na(dt$SpudDate) & dt$SpudDate <= d
+    not_on_prod_yet <- (is.na(dt$FirstProdDate) | dt$FirstProdDate > d)
+    not_abandoned   <- (is.na(dt$AbandonmentDate) | dt$AbandonmentDate > d)
+
+    # enforce hold period: the well must have existed N days before snapshot
+    long_enough <- !is.na(dt$SpudDate) &
+                   (as.numeric(d - dt$SpudDate) >= as.numeric(min_hold_days))
+
+    # confidentiality filter
     if (exclude_conf) {
-      conf_vals <- if ("ConfidentialType" %in% names(dt)) dt$ConfidentialType else NA_character_
-      conf_vals <- as.character(conf_vals)
-      conf_keep <- is.na(conf_vals) | trimws(conf_vals) == "" | toupper(trimws(conf_vals)) == "NON-CONFIDENTIAL"
-      keep <- keep & conf_keep
+      conf_ok <- (is.na(dt$ConfidentialType) |
+                  dt$ConfidentialType == "" |
+                  toupper(dt$ConfidentialType) == "NON-CONFIDENTIAL")
+    } else {
+      conf_ok <- TRUE
     }
-    keep
+
+    drilled_before_snap & not_on_prod_yet & not_abandoned & long_enough & conf_ok
+  }
+
+  # Summarize DUC counts for a single snapshot date
+  duc_summary_for_date <- function(wx_dt, snap_date, group_col, min_hold_days, exclude_conf) {
+    # wx_dt MUST include these cols:
+    # UWI, OperatorName, Formation, FieldName, ProvinceState,
+    # SpudDate, FirstProdDate, AbandonmentDate, ConfidentialType
+    keep_mask <- is_duc_at(
+      wx_dt,
+      snap_date,
+      min_hold_days = min_hold_days,
+      exclude_conf = exclude_conf
+    )
+    if (!any(keep_mask, na.rm = TRUE)) {
+      return(data.table::data.table(
+        Group = character(0),
+        DUC_Count = integer(0),
+        SnapshotDate = as.Date(character(0))
+      ))
+    }
+
+    # select grouping col dynamically, safely
+    grp_col <- group_col
+    tmp <- wx_dt[keep_mask,
+                 .(GroupVal = get(grp_col)),
+                 ]
+    tmp[, GroupVal := ifelse(is.na(GroupVal) | GroupVal == "", "(Unknown)", as.character(GroupVal))]
+
+    out <- tmp[, .(DUC_Count = .N), by = .(GroupVal)]
+    out[, SnapshotDate := as.Date(snap_date)]
+    data.table::setnames(out, "GroupVal", "Group")
+    out[order(-DUC_Count)]
   }
   
   # Initial population of pickers (non-cascading)
@@ -2997,121 +3070,121 @@ server <- function(input, output, session) {
   )
 
   observeEvent(input$duc_apply, {
-    req(!is.null(wells_sf), inherits(wells_sf, "sf"))
-    req(nrow(wells_sf) > 0)
-    req(!is.null(input$duc_dates))
+    req(wells_sf_global)
+    req(nrow(wells_sf_global) > 0)
 
-    dates <- sort(unique(as.Date(input$duc_dates)))
-    req(length(dates) >= 1)
+    # get user inputs safely
+    snap_dates <- sort(unique(as.Date(input$duc_dates)))
+    req(length(snap_dates) > 0)
 
-    gcol <- input$duc_group_by %||% "OperatorName"
-    exclude_conf <- isTRUE(input$duc_exclude_conf)
-
-    wx <- data.table::as.data.table(sf::st_drop_geometry(wells_sf))
-    cols_keep <- c("UWI", "OperatorName", "Formation", "FieldName", "ProvinceState",
-                   "SpudDate", "FirstProdDate", "AbandonmentDate", "ConfidentialType")
-    missing_cols <- setdiff(c("SpudDate", "FirstProdDate", "AbandonmentDate"), names(wx))
-    if (length(missing_cols)) {
-      reactive_vals$duc_comp <- data.table::data.table()
-      return(invisible(NULL))
+    grp_col <- input$duc_group_by
+    if (is.null(grp_col) || !(grp_col %in% c("OperatorName","Formation","FieldName","ProvinceState"))) {
+      grp_col <- "OperatorName"
     }
-    keep_cols <- intersect(cols_keep, names(wx))
-    wx <- wx[, ..keep_cols]
-    for (nm in intersect(c("SpudDate", "FirstProdDate", "AbandonmentDate"), names(wx))) {
-      if (!inherits(wx[[nm]], "Date")) {
-        wx[, (nm) := as.Date(get(nm))]
+
+    min_hold_days <- as.numeric(input$duc_min_hold_days %||% 30)
+    exclude_conf  <- isTRUE(input$duc_exclude_conf)
+
+    # strip geometry and grab only the columns we need
+    wx <- data.table::as.data.table(sf::st_drop_geometry(wells_sf_global))[
+      , .(
+          UWI,
+          OperatorName    = OperatorName %||% NA_character_,
+          Formation       = Formation %||% NA_character_,
+          FieldName       = FieldName %||% NA_character_,
+          ProvinceState   = ProvinceState %||% NA_character_,
+          SpudDate        = as.Date(SpudDate),
+          FirstProdDate   = as.Date(FirstProdDate),
+          AbandonmentDate = as.Date(AbandonmentDate),
+          ConfidentialType= ConfidentialType %||% NA_character_
+        )
+    ]
+
+    # loop snapshots, bind
+    snap_list <- lapply(
+      snap_dates,
+      function(sd) {
+        duc_summary_for_date(
+          wx_dt = wx,
+          snap_date = sd,
+          group_col = grp_col,
+          min_hold_days = min_hold_days,
+          exclude_conf = exclude_conf
+        )
       }
-    }
-    if (!"ConfidentialType" %in% names(wx)) {
-      wx[, ConfidentialType := NA_character_]
-    } else if (!is.character(wx$ConfidentialType)) {
-      wx[, ConfidentialType := as.character(ConfidentialType)]
-    }
+    )
+    duc_comp_dt <- data.table::rbindlist(snap_list, use.names = TRUE, fill = TRUE)
 
-    out_list <- lapply(dates, function(d) {
-      mask <- is_duc_at(wx, d, exclude_conf = exclude_conf)
-      if (!any(mask)) return(data.table::data.table())
-      subset_dt <- data.table::copy(wx[mask])
-      if (!gcol %in% names(subset_dt)) {
-        subset_dt[, (gcol) := "(Unknown)"]
-      }
-      subset_dt[, (gcol) := {
-        vals <- as.character(get(gcol))
-        vals[is.na(vals) | trimws(vals) == ""] <- "(Unknown)"
-        vals
-      }]
-      subset_dt[, .(DUC_Count = .N), by = ..gcol][, Snapshot := as.Date(d)][order(-DUC_Count)]
-    })
-
-    duc_comp <- data.table::rbindlist(out_list, use.names = TRUE, fill = TRUE)
-    if ("Snapshot" %in% names(duc_comp)) {
-      duc_comp[, Snapshot := as.Date(Snapshot)]
-    }
-    reactive_vals$duc_comp <- duc_comp
-  }, ignoreNULL = TRUE)
+    # store in a reactiveValues slot called duc_comp (create reactive_vals$duc_comp if needed)
+    reactive_vals$duc_comp <- duc_comp_dt
+  })
 
   output$duc_headline <- renderText({
     dt <- reactive_vals$duc_comp
-    if (!is.data.frame(dt) || !nrow(dt)) return("Compute DUCs to see results.")
-    snaps <- unique(dt$Snapshot)
-    paste0("DUC totals for ", length(snaps), " snapshot date(s)")
+    if (is.null(dt) || !nrow(dt)) {
+      return("No DUC results yet. Pick snapshot dates and click Calculate.")
+    }
+    snaps <- sort(unique(dt$SnapshotDate))
+    total_by_snap <- dt[, .(TotalDUCs = sum(DUC_Count, na.rm = TRUE)), by = SnapshotDate]
+    paste0(
+      "DUC counts for ", length(snaps), " snapshot(s). ",
+      paste0(
+        format(total_by_snap$SnapshotDate, "%Y-%m-%d"), ": ",
+        total_by_snap$TotalDUCs, " wells",
+        collapse = " | "
+      )
+    )
   })
 
   output$duc_bar_compare <- plotly::renderPlotly({
     dt <- reactive_vals$duc_comp
-    req(is.data.frame(dt), nrow(dt) > 0)
-    grp_col <- input$duc_group_by %||% "OperatorName"
-    if (!grp_col %in% names(dt)) {
-      empty_plot <- ggplot2::ggplot() + ggplot2::labs(title = "No grouping column available.")
-      return(plotly::ggplotly(empty_plot))
-    }
+    req(!is.null(dt), nrow(dt) > 0)
 
-    totals <- dt[, .(Total = sum(DUC_Count, na.rm = TRUE)), by = ..grp_col]
-    totals <- totals[order(-Total)]
-    topN <- 20L
-    top_groups <- totals[[grp_col]][seq_len(min(nrow(totals), topN))]
-    plot_dt <- dt[get(grp_col) %in% top_groups]
-    if (!nrow(plot_dt)) {
-      empty_plot <- ggplot2::ggplot() + ggplot2::labs(title = "No DUCs for selected snapshots.")
-      return(plotly::ggplotly(empty_plot))
-    }
+    # limit to top N groups across all snapshots for readability
+    topN <- 20
+    top_groups <- dt[, .(TotalAllSnaps = sum(DUC_Count, na.rm = TRUE)), by = Group][
+      order(-TotalAllSnaps)
+    ][1:min(.N, topN)]$Group
 
-    plot_dt[[grp_col]] <- factor(plot_dt[[grp_col]], levels = rev(unique(plot_dt[[grp_col]])))
-    p <- ggplot2::ggplot(plot_dt, ggplot2::aes_string(
-      x = grp_col, y = "DUC_Count", fill = "factor(Snapshot)"
-    )) +
+    plot_dt <- dt[Group %in% top_groups]
+
+    p <- ggplot2::ggplot(
+      plot_dt,
+      ggplot2::aes(
+        x = Group,
+        y = DUC_Count,
+        fill = as.factor(SnapshotDate)
+      )
+    ) +
       ggplot2::geom_col(position = "dodge") +
-      ggplot2::labs(x = grp_col, y = "DUC count", fill = "Snapshot") +
       ggplot2::coord_flip() +
+      ggplot2::labs(
+        x = NULL,
+        y = "DUC count",
+        fill = "Snapshot"
+      ) +
       ggplot2::theme_minimal(base_size = 12)
+
     plotly::ggplotly(p)
   })
 
   output$duc_table <- DT::renderDT({
     dt <- reactive_vals$duc_comp
-    req(is.data.frame(dt))
-    if (!nrow(dt)) {
-      return(DT::datatable(data.frame(Message = "No DUCs for selected snapshots."), options = list(searching = FALSE, paging = FALSE, info = FALSE), rownames = FALSE))
-    }
-    dt_display <- data.table::copy(dt)
-    if ("Snapshot" %in% names(dt_display)) {
-      data.table::setnames(dt_display, "Snapshot", "SnapshotDate")
-    }
-    if (!"SnapshotDate" %in% names(dt_display)) {
-      dt_display[, SnapshotDate := as.Date(NA)]
-    }
-    DT::datatable(dt_display[order(SnapshotDate, -DUC_Count)], rownames = FALSE, options = list(pageLength = 25))
+    req(!is.null(dt), nrow(dt) > 0)
+    DT::datatable(
+      dt[order(SnapshotDate, -DUC_Count)],
+      rownames = FALSE,
+      options = list(pageLength = 25, scrollX = TRUE)
+    )
   })
 
   output$duc_download <- downloadHandler(
-    filename = function() paste0("duc_snapshots_", Sys.Date(), ".csv"),
+    filename = function() {
+      paste0("duc_snapshots_", Sys.Date(), ".csv")
+    },
     content = function(file) {
       dt <- reactive_vals$duc_comp
-      if (!is.data.frame(dt) || !nrow(dt)) {
-        data.table::fwrite(data.table::data.table(Message = "No DUC data available."), file)
-      } else {
-        data.table::fwrite(data.table::as.data.table(dt), file)
-      }
+      data.table::fwrite(dt, file)
     }
   )
 
