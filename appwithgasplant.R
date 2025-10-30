@@ -1108,6 +1108,8 @@ ui <- fluidPage(
                                   selected = "OperatorName"
                                 ),
 
+                                uiOutput("duc_group_filter_ui"),
+
                                 actionButton(
                                   "duc_apply",
                                   "Calculate DUCs",
@@ -1184,7 +1186,8 @@ server <- function(input, output, session) {
     max_prod_date = Sys.Date(),
     min_first_prod_date_overall = as.Date("1900-01-01"),
     max_first_prod_date_overall = Sys.Date(),
-    duc_comp = data.table::data.table()
+    duc_comp = data.table::data.table(),
+    duc_groups_available = character(0)
   )
 
   # --- PATCH 1A: safe boolean for "Oil + Condensate" toggle
@@ -3183,6 +3186,20 @@ server <- function(input, output, session) {
 
     # store in a reactiveValues slot called duc_comp (create reactive_vals$duc_comp if needed)
     reactive_vals$duc_comp <- duc_comp_dt
+    all_groups <- sort(unique(duc_comp_dt$Group))
+    reactive_vals$duc_groups_available <- all_groups
+  })
+
+  output$duc_group_filter_ui <- renderUI({
+    groups <- reactive_vals$duc_groups_available
+    req(groups)
+    selectizeInput(
+      "duc_group_filter",
+      label = paste0("Filter ", ifelse(input$duc_group_by == "ProvinceState", "provinces", "groups"), " to display"),
+      choices = groups,
+      multiple = TRUE,
+      selected = groups[1:min(10, length(groups))]
+    )
   })
 
   output$duc_headline <- renderText({
@@ -3206,13 +3223,21 @@ server <- function(input, output, session) {
     dt <- reactive_vals$duc_comp
     req(!is.null(dt), nrow(dt) > 0)
 
-    # limit to top N groups across all snapshots for readability
-    topN <- 20
-    top_groups <- dt[, .(TotalAllSnaps = sum(DUC_Count, na.rm = TRUE)), by = Group][
-      order(-TotalAllSnaps)
-    ][1:min(.N, topN)]$Group
+    if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
+      dt <- dt[Group %in% input$duc_group_filter]
+    }
+    req(nrow(dt) > 0)
 
-    plot_dt <- dt[Group %in% top_groups]
+    if (identical(input$duc_group_by, "ProvinceState")) {
+      plot_dt <- dt
+    } else {
+      topN <- 20
+      top_groups <- dt[, .(TotalAllSnaps = sum(DUC_Count, na.rm = TRUE)), by = Group][
+        order(-TotalAllSnaps)
+      ][1:min(.N, topN)]$Group
+      plot_dt <- dt[Group %in% top_groups]
+    }
+    req(nrow(plot_dt) > 0)
 
     p <- ggplot2::ggplot(
       plot_dt,
@@ -3237,6 +3262,10 @@ server <- function(input, output, session) {
   output$duc_table <- DT::renderDT({
     dt <- reactive_vals$duc_comp
     req(!is.null(dt), nrow(dt) > 0)
+    if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
+      dt <- dt[Group %in% input$duc_group_filter]
+    }
+    req(nrow(dt) > 0)
     DT::datatable(
       dt[order(SnapshotDate, -DUC_Count)],
       rownames = FALSE,
