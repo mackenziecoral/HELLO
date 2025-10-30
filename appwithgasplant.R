@@ -1180,10 +1180,18 @@ ui <- fluidPage(
                           max = Sys.Date()
                         ),
                         numericInput(
-                          "shutin_zero_prod_months",
+                          "shutin_no_prod_months",
                           "No production for at least (months):",
-                          value = 6,
+                          value = 2,
                           min = 1,
+                          max = 12,
+                          step = 1
+                        ),
+                        numericInput(
+                          "shutin_recent_window_months",
+                          "Lookback window for recent activity (months):",
+                          value = 12,
+                          min = 3,
                           max = 36,
                           step = 1
                         ),
@@ -1195,14 +1203,13 @@ ui <- fluidPage(
                         helpText(
                           "Definition of 'shut-in' here:
 ",
-                          "1) Well has a FirstProdDate (it actually produced at some point).
+                          "1) Well produced at least once in the last 'recent activity' window (X months before the snapshot).
 ",
-                          "2) AbandonmentDate is NA OR after the snapshot date.
+                          "2) The well has zero production for EACH of the most recent 'no production' window (Y months before the snapshot).
 ",
-                          "3) No measured production in the last X months before the snapshot date.
+                          "3) AbandonmentDate is blank or after the snapshot.
 ",
-                          "We flag the last month a well had ANY volume (oil+gas+condensate etc.).",
-                          "If that last-prod month is older than the cutoff, it's counted as shut-in."
+                          "This excludes dead wells that haven't flowed in years and focuses on wells that were active recently but are currently turned off."
                         )
                       ),
                       column(
@@ -1267,7 +1274,8 @@ server <- function(input, output, session) {
     shutin_summary = data.table::data.table(),
     shutin_detail = data.table::data.table(),
     shutin_snapshot = as.Date(NA),
-    shutin_zero_months = NA_real_
+    shutin_no_prod_months = NA_real_,
+    shutin_recent_window_months = NA_real_
   )
 
   # --- PATCH 1A: safe boolean for "Oil + Condensate" toggle
@@ -3491,14 +3499,16 @@ server <- function(input, output, session) {
 
   observeEvent(input$calculate_shutin, {
     req(input$shutin_snapshot_date)
-    req(input$shutin_zero_prod_months)
+    req(input$shutin_no_prod_months)
+    req(input$shutin_recent_window_months)
 
     snapshot_date <- as.Date(input$shutin_snapshot_date)
-    zero_months <- as.numeric(input$shutin_zero_prod_months)
-    cutoff_date <- snapshot_date - lubridate::days(30 * zero_months)
+    no_prod_months <- as.integer(input$shutin_no_prod_months)
+    recent_window_mo <- as.integer(input$shutin_recent_window_months)
 
     reactive_vals$shutin_snapshot <- snapshot_date
-    reactive_vals$shutin_zero_months <- zero_months
+    reactive_vals$shutin_no_prod_months <- no_prod_months
+    reactive_vals$shutin_recent_window_months <- recent_window_mo
 
     base_sf <- reactive_vals$wells_filtered_base
     if (is.null(base_sf) || nrow(base_sf) == 0) {
@@ -3541,6 +3551,26 @@ server <- function(input, output, session) {
       return(invisible(NULL))
     }
 
+    build_month_window <- function(snap_date, n_months) {
+      if (is.na(snap_date) || n_months <= 0) return(as.Date(character()))
+      snap_month_start <- lubridate::floor_date(snap_date, unit = "month")
+      last_full_month_start <- lubridate::floor_date(snap_month_start - lubridate::days(1), unit = "month")
+      rev(sapply(seq_len(n_months) - 1, function(i) {
+        lubridate::floor_date(last_full_month_start - lubridate::days(30 * i), unit = "month")
+      }))
+    }
+
+    silent_window_months <- build_month_window(snapshot_date, no_prod_months)
+    recent_window_months <- build_month_window(snapshot_date, recent_window_mo)
+    all_needed_months <- sort(unique(c(silent_window_months, recent_window_months)))
+
+    if (!length(all_needed_months)) {
+      reactive_vals$shutin_summary <- data.table::data.table()
+      reactive_vals$shutin_detail <- data.table::data.table()
+      showNotification("Unable to derive production windows for shut-in analysis.", type = "warning", duration = 5)
+      return(invisible(NULL))
+    }
+
     if (is.null(con) || !DBI::dbIsValid(con)) {
       con <<- connect_to_db()
     }
@@ -3554,15 +3584,15 @@ server <- function(input, output, session) {
 
     prod_sql <- glue::glue_sql(
       "SELECT
-         p.GSL_UWI,
-         p.PROD_MONTH,
-         p.OIL_BBL,
-         p.COND_BBL,
-         p.GAS_MCF
-       FROM PDEN_MONTHLY p
-       WHERE p.PROD_MONTH <= {snapshot_date}
-         AND p.GSL_UWI IN ({uwis*})",
-      snapshot_date = snapshot_date,
+        p.GSL_UWI,
+        p.PROD_MONTH,
+        p.OIL_BBL,
+        p.COND_BBL,
+        p.GAS_MCF
+      FROM PDEN_MONTHLY p
+      WHERE p.PROD_MONTH IN ({all_needed_months*})
+        AND p.GSL_UWI IN ({uwis*})",
+      all_needed_months = all_needed_months,
       uwis = valid_ids,
       .con = con
     )
@@ -3581,6 +3611,8 @@ server <- function(input, output, session) {
       if (!inherits(prod_dt$PROD_MONTH, "Date")) {
         prod_dt[, PROD_MONTH := as.Date(PROD_MONTH)]
       }
+      prod_dt[, GSL_UWI := trimws(as.character(GSL_UWI))]
+      prod_dt <- prod_dt[GSL_UWI %in% valid_ids]
 
       vol_cols <- c("OIL_BBL", "COND_BBL", "GAS_MCF")
       for (vc in vol_cols) {
@@ -3588,38 +3620,90 @@ server <- function(input, output, session) {
         prod_dt[is.na(get(vc)), (vc) := 0]
       }
 
-      prod_dt[, TOTAL_VOL_BOE := (OIL_BBL + COND_BBL) + (GAS_MCF / 6)]
+      prod_dt[, TOTAL_VOL_BOE := (OIL_BBL + COND_BBL) + (GAS_MCF / 6.0)]
+    } else {
+      prod_dt <- data.table::data.table(
+        GSL_UWI = character(),
+        PROD_MONTH = as.Date(character()),
+        TOTAL_VOL_BOE = numeric()
+      )
+    }
 
+    sum_over_window <- function(month_vec, wells_scope) {
+      if (!length(wells_scope)) {
+        return(data.table::data.table(GSL_UWI = character(), WINDOW_VOL_BOE = numeric()))
+      }
+      if (!length(month_vec)) {
+        return(data.table::data.table(GSL_UWI = wells_scope, WINDOW_VOL_BOE = rep(0, length(wells_scope))))
+      }
+      combo <- data.table::CJ(GSL_UWI = wells_scope, PROD_MONTH = month_vec, unique = TRUE)
+      if (nrow(prod_dt)) {
+        combo <- merge(
+          combo,
+          prod_dt[, .(GSL_UWI, PROD_MONTH, TOTAL_VOL_BOE)],
+          by = c("GSL_UWI", "PROD_MONTH"),
+          all.x = TRUE,
+          sort = FALSE
+        )
+      } else {
+        combo[, TOTAL_VOL_BOE := 0]
+      }
+      combo[is.na(TOTAL_VOL_BOE), TOTAL_VOL_BOE := 0]
+      combo[, .(WINDOW_VOL_BOE = sum(TOTAL_VOL_BOE, na.rm = TRUE)), by = GSL_UWI]
+    }
+
+    silent_sum_dt <- sum_over_window(silent_window_months, valid_ids)
+    data.table::setnames(silent_sum_dt, "WINDOW_VOL_BOE", "SILENT_VOL_BOE")
+
+    recent_sum_dt <- sum_over_window(recent_window_months, valid_ids)
+    data.table::setnames(recent_sum_dt, "WINDOW_VOL_BOE", "RECENT_VOL_BOE")
+
+    window_stats <- merge(
+      recent_sum_dt,
+      silent_sum_dt,
+      by = "GSL_UWI",
+      all = TRUE
+    )
+    window_stats[is.na(RECENT_VOL_BOE), RECENT_VOL_BOE := 0]
+    window_stats[is.na(SILENT_VOL_BOE), SILENT_VOL_BOE := 0]
+
+    last_prod_by_well <- data.table::data.table(GSL_UWI = character(), LAST_PROD_MONTH = as.Date(character()))
+    if (nrow(prod_dt)) {
       last_prod_by_well <- prod_dt[TOTAL_VOL_BOE > 0,
         .(LAST_PROD_MONTH = max(PROD_MONTH, na.rm = TRUE)),
         by = GSL_UWI
       ]
-    } else {
-      last_prod_by_well <- data.table::data.table(
-        GSL_UWI = character(),
-        LAST_PROD_MONTH = as.Date(character())
-      )
-    }
-
-    if ("GSL_UWI" %in% names(last_prod_by_well)) {
-      last_prod_by_well[, GSL_UWI := trimws(as.character(GSL_UWI))]
     }
 
     shutin_candidates <- merge(
       wells_base,
+      window_stats,
+      by = "GSL_UWI",
+      all.x = TRUE,
+      sort = FALSE
+    )
+    shutin_candidates <- merge(
+      shutin_candidates,
       last_prod_by_well,
       by = "GSL_UWI",
       all.x = TRUE,
       sort = FALSE
     )
 
+    shutin_candidates[is.na(RECENT_VOL_BOE), RECENT_VOL_BOE := 0]
+    shutin_candidates[is.na(SILENT_VOL_BOE), SILENT_VOL_BOE := 0]
     shutin_candidates[, LAST_PROD_MONTH := as.Date(LAST_PROD_MONTH)]
+    shutin_candidates[, MonthsSinceLastProd := ifelse(
+      is.na(LAST_PROD_MONTH),
+      NA_real_,
+      as.numeric(difftime(snapshot_date, LAST_PROD_MONTH, units = "days")) / 30.4375
+    )]
 
     shutin_flagged <- shutin_candidates[
-      !is.na(FirstProdDate) &
-      as.Date(FirstProdDate) <= snapshot_date &
+      (RECENT_VOL_BOE > 0) &
+      (SILENT_VOL_BOE == 0) &
       (is.na(AbandonmentDate) | as.Date(AbandonmentDate) > snapshot_date) &
-      (is.na(LAST_PROD_MONTH) | LAST_PROD_MONTH < cutoff_date)
+      !is.na(FirstProdDate) & as.Date(FirstProdDate) <= snapshot_date
     ]
 
     if (!nrow(shutin_flagged)) {
@@ -3641,37 +3725,38 @@ server <- function(input, output, session) {
       GSL_UWI,
       OperatorName,
       ProvinceState,
-      SpudDate,
-      FirstProdDate,
+      SpudDate = as.Date(SpudDate),
+      FirstProdDate = as.Date(FirstProdDate),
       LAST_PROD_MONTH,
-      MonthsSinceLastProd = ifelse(!is.na(LAST_PROD_MONTH), round(as.numeric(snapshot_date - LAST_PROD_MONTH) / 30.4375, 1), NA_real_),
-      AbandonmentDate,
+      MonthsSinceLastProd = round(MonthsSinceLastProd, 1),
+      RECENT_VOL_BOE,
+      SILENT_VOL_BOE,
+      AbandonmentDate = as.Date(AbandonmentDate),
       CurrentStatus,
       ShutIn = TRUE
     )]
-
-    char_cols <- c("OperatorName", "ProvinceState", "CurrentStatus")
-    for (cc in char_cols) {
-      if (cc %in% names(shutin_detail)) {
-        shutin_detail[, (cc) := as.character(get(cc))]
-      }
-    }
 
     reactive_vals$shutin_summary <- shutin_summary
     reactive_vals$shutin_detail <- shutin_detail
 
     showNotification(
-      paste0("Identified ", format(nrow(shutin_detail), big.mark = ","), " shut-in wells as of ", snapshot_date, "."),
+      paste0(
+        "Identified ",
+        format(nrow(shutin_detail), big.mark = ","),
+        " shut-in wells as of ",
+        snapshot_date,
+        "."
+      ),
       type = "message",
       duration = 4
     )
   })
-
   output$shutin_plot <- renderPlot({
     summary_dt <- reactive_vals$shutin_summary
     snapshot_date <- reactive_vals$shutin_snapshot
-    zero_months <- reactive_vals$shutin_zero_months
-    req(!is.null(summary_dt), !is.na(snapshot_date), !is.na(zero_months))
+    no_prod_months <- reactive_vals$shutin_no_prod_months
+    recent_window_mo <- reactive_vals$shutin_recent_window_months
+    req(!is.null(summary_dt), !is.na(snapshot_date), !is.na(no_prod_months), !is.na(recent_window_mo))
     validate(need(nrow(summary_dt) > 0, "No shut-in wells match the current criteria."))
 
     ggplot(summary_dt,
@@ -3684,9 +3769,11 @@ server <- function(input, output, session) {
         title = paste0(
           "Shut-in wells as of ",
           format(snapshot_date, "%Y-%m-%d"),
-          " (no production in last ",
-          zero_months,
-          " months)"
+          " (recent window = ",
+          recent_window_mo,
+          " mo; zero production window = ",
+          no_prod_months,
+          " mo)"
         )
       ) +
       theme_minimal(base_size = 12)
@@ -3697,7 +3784,7 @@ server <- function(input, output, session) {
     req(!is.null(detail_dt))
     validate(need(nrow(detail_dt) > 0, "No shut-in wells match the current criteria."))
 
-    detail_dt[order(OperatorName, ProvinceState, GSL_UWI)]
+    detail_dt[order(SnapshotDate, OperatorName, ProvinceState, GSL_UWI)]
   },
   options = list(pageLength = 25, scrollX = TRUE),
   rownames = FALSE)
@@ -3721,7 +3808,7 @@ server <- function(input, output, session) {
       if (is.null(dt) || !nrow(dt)) {
         data.table::fwrite(data.table::data.table(), file)
       } else {
-        data.table::fwrite(dt[order(OperatorName, ProvinceState, GSL_UWI)], file)
+        data.table::fwrite(dt[order(SnapshotDate, OperatorName, ProvinceState, GSL_UWI)], file)
       }
     }
   )
