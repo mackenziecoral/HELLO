@@ -1072,6 +1072,24 @@ ui <- fluidPage(
                                   step = 10
                                 ),
 
+                                sliderInput(
+                                  "duc_max_hold_days",
+                                  "Max days allowed since spud (exclude long-term zombies)",
+                                  min = 30,
+                                  max = 2000,
+                                  value = 730,
+                                  step = 30
+                                ),
+
+                                sliderInput(
+                                  "duc_spud_recency_months",
+                                  "Only include wells spud within last __ months (recency window)",
+                                  min = 1,
+                                  max = 60,
+                                  value = 36,
+                                  step = 1
+                                ),
+
                                 checkboxInput(
                                   "duc_exclude_conf",
                                   "Exclude wells flagged Confidential",
@@ -1105,10 +1123,12 @@ ui <- fluidPage(
                                     tags$li("• SpudDate is not NA AND SpudDate ≤ D;"),
                                     tags$li("• (FirstProdDate is NA) OR (FirstProdDate > D);"),
                                     tags$li("• (AbandonmentDate is NA) OR (AbandonmentDate > D);"),
-                                    tags$li("• The well has been drilled for at least `Min days since spud` days by D (SpudDate ≤ D - N days);"),
-                                    tags$li("• If 'Exclude wells flagged Confidential' is checked, wells with ConfidentialType not empty are dropped.")
+                                    tags$li("• The well has existed at least 'Min days since spud' by D (so we're not counting wells still in active completion / flowback);"),
+                                    tags$li("• The well has existed no more than 'Max days allowed since spud' by D (so we drop multi-year zombies / uneconomic suspensions);"),
+                                    tags$li("• The well was spud within the last 'Recency window' months before D (keeps the backlog focused on current programs);"),
+                                    tags$li("• If 'Exclude wells flagged Confidential' is checked, wells with ConfidentialType set are dropped.")
                                   ),
-                                  tags$small("Counts are grouped by the selected dimension (Operator, Formation, Field, Province). The bar chart shows absolute DUC totals per snapshot date; not just deltas.")
+                                  tags$small("Counts are grouped by the selected dimension (Operator, Formation, Field, Province). The bar chart shows absolute DUC totals per snapshot date, not just deltas.")
                                 )
                               ),
                               column(8,
@@ -1508,19 +1528,36 @@ server <- function(input, output, session) {
   # ---- DUC logic helpers ----
 
   # Returns TRUE/FALSE vector telling whether each row is considered a DUC
-  is_duc_at <- function(dt, snap_date, min_hold_days = 30L, exclude_conf = TRUE) {
+  is_duc_at <- function(
+    dt,
+    snap_date,
+    min_hold_days      = 30L,
+    max_hold_days      = 730L,
+    recency_months     = 36L,
+    exclude_conf       = TRUE
+  ) {
     d <- as.Date(snap_date)
 
-    # basic drilled-but-not-onstream tests
+    # Core conditions
     drilled_before_snap <- !is.na(dt$SpudDate) & dt$SpudDate <= d
-    not_on_prod_yet <- (is.na(dt$FirstProdDate) | dt$FirstProdDate > d)
-    not_abandoned   <- (is.na(dt$AbandonmentDate) | dt$AbandonmentDate > d)
+    not_on_prod_yet     <- (is.na(dt$FirstProdDate) | dt$FirstProdDate > d)
+    not_abandoned       <- (is.na(dt$AbandonmentDate) | dt$AbandonmentDate > d)
 
-    # enforce hold period: the well must have existed N days before snapshot
-    long_enough <- !is.na(dt$SpudDate) &
-                   (as.numeric(d - dt$SpudDate) >= as.numeric(min_hold_days))
+    # Age since spud at snapshot
+    age_days <- as.numeric(d - dt$SpudDate)
 
-    # confidentiality filter
+    # 1. Minimum hold threshold (exclude wells that are too fresh)
+    long_enough <- !is.na(age_days) & (age_days >= as.numeric(min_hold_days))
+
+    # 2. Maximum hold threshold (exclude zombie wells that have sat for years)
+    not_too_old <- !is.na(age_days) & (age_days <= as.numeric(max_hold_days))
+
+    # 3. Recency filter: spud must be within the last N months at snapshot
+    #    Convert months to ~30.4375 days for a rough but consistent cutoff.
+    recency_days <- as.numeric(recency_months) * 30.4375
+    recent_enough <- !is.na(age_days) & (age_days <= recency_days)
+
+    # Confidential filter
     if (exclude_conf) {
       conf_ok <- (is.na(dt$ConfidentialType) |
                   dt$ConfidentialType == "" |
@@ -1529,19 +1566,35 @@ server <- function(input, output, session) {
       conf_ok <- TRUE
     }
 
-    drilled_before_snap & not_on_prod_yet & not_abandoned & long_enough & conf_ok
+    drilled_before_snap &
+      not_on_prod_yet &
+      not_abandoned &
+      long_enough &
+      not_too_old &
+      recent_enough &
+      conf_ok
   }
 
   # Summarize DUC counts for a single snapshot date
-  duc_summary_for_date <- function(wx_dt, snap_date, group_col, min_hold_days, exclude_conf) {
+  duc_summary_for_date <- function(
+    wx_dt,
+    snap_date,
+    group_col,
+    min_hold_days,
+    max_hold_days,
+    recency_months,
+    exclude_conf
+  ) {
     # wx_dt MUST include these cols:
     # UWI, OperatorName, Formation, FieldName, ProvinceState,
     # SpudDate, FirstProdDate, AbandonmentDate, ConfidentialType
     keep_mask <- is_duc_at(
-      wx_dt,
-      snap_date,
-      min_hold_days = min_hold_days,
-      exclude_conf = exclude_conf
+      dt             = wx_dt,
+      snap_date      = snap_date,
+      min_hold_days  = min_hold_days,
+      max_hold_days  = max_hold_days,
+      recency_months = recency_months,
+      exclude_conf   = exclude_conf
     )
     if (!any(keep_mask, na.rm = TRUE)) {
       return(data.table::data.table(
@@ -1555,12 +1608,21 @@ server <- function(input, output, session) {
     grp_col <- group_col
     tmp <- wx_dt[keep_mask,
                  .(GroupVal = get(grp_col)),
-                 ]
-    tmp[, GroupVal := ifelse(is.na(GroupVal) | GroupVal == "", "(Unknown)", as.character(GroupVal))]
+    ]
 
-    out <- tmp[, .(DUC_Count = .N), by = .(GroupVal)]
+    tmp[, GroupVal := ifelse(
+      is.na(GroupVal) | GroupVal == "",
+      "(Unknown)",
+      as.character(GroupVal)
+    )]
+
+    out <- tmp[
+      , .(DUC_Count = .N),
+      by = .(GroupVal)
+    ]
     out[, SnapshotDate := as.Date(snap_date)]
     data.table::setnames(out, "GroupVal", "Group")
+
     out[order(-DUC_Count)]
   }
   
@@ -3083,6 +3145,8 @@ server <- function(input, output, session) {
     }
 
     min_hold_days <- as.numeric(input$duc_min_hold_days %||% 30)
+    max_hold_days  <- as.numeric(input$duc_max_hold_days %||% 730)
+    recency_months <- as.numeric(input$duc_spud_recency_months %||% 36)
     exclude_conf  <- isTRUE(input$duc_exclude_conf)
 
     # strip geometry and grab only the columns we need
@@ -3109,6 +3173,8 @@ server <- function(input, output, session) {
           snap_date = sd,
           group_col = grp_col,
           min_hold_days = min_hold_days,
+          max_hold_days = max_hold_days,
+          recency_months = recency_months,
           exclude_conf = exclude_conf
         )
       }
