@@ -151,6 +151,20 @@ normalize_operator_label <- function(x) {
   out
 }
 
+util_palette <- function(x) {
+  leaflet::colorBin(
+    "viridis",
+    domain = x,
+    bins = c(0, 0.5, 0.7, 0.85, 1.0, 1.2, Inf),
+    right = FALSE,
+    na.color = "#cccccc"
+  )
+}
+
+op_palette <- function(op_levels) {
+  leaflet::colorFactor(palette = custom_palette, domain = op_levels, na.color = "#999999")
+}
+
 normalize_type_label <- function(x) {
   out <- trimws(as.character(x))
   out[is.na(out) | out == ""] <- "(Unknown)"
@@ -1019,7 +1033,16 @@ ui <- fluidPage(
                                      selectInput("gp_month", "Month", choices = c("Loading..." = ""), selected = NULL),
                                      actionButton("gp_reload", "Load Gas Plant Data", class = "btn-primary")
                               ),
-                              column(8,
+                              column(4,
+                                     selectInput(
+                                       "gp_color_by",
+                                       "Color by",
+                                       choices = c("Utilization" = "util", "Operator" = "op"),
+                                       selected = "util"
+                                     ),
+                                     helpText("Utilization = Monthly Throughput / Monthly Capacity (from ST50).")
+                              ),
+                              column(4,
                                      helpText("Decoupled from well filters. Uses monthly volumes + ST50 capacity. Operator from monthly file.")
                               )
                             ),
@@ -1030,14 +1053,30 @@ ui <- fluidPage(
                    tabPanel("DUCs Over Time",
                             fluidRow(
                               column(4,
-                                     dateInput("duc_date_a", "Snapshot A", value = as.Date("2024-12-31")),
-                                     dateInput("duc_date_b", "Snapshot B", value = as.Date("2025-12-31")),
+                                     shinyWidgets::airDatepickerInput(
+                                       inputId = "duc_dates",
+                                       label   = "Snapshot dates",
+                                       value   = c(as.Date("2024-12-31"), as.Date("2025-12-31")),
+                                       multiple = TRUE,
+                                       clearButton = TRUE
+                                     ),
                                      checkboxInput("duc_exclude_conf", "Exclude Confidential wells", TRUE),
                                      pickerInput("duc_group_by", "Group by:",
                                                  choices = c("Operator" = "OperatorName", "Formation" = "Formation",
                                                              "Field" = "FieldName", "Province/State" = "ProvinceState"),
                                                  selected = "OperatorName"),
-                                     actionButton("duc_apply", "Compute DUCs", class = "btn-primary")
+                                     actionButton("duc_apply", "Compute DUCs", class = "btn-primary"),
+                                     shiny::wellPanel(
+                                       tags$strong("How DUCs are calculated in this tool"),
+                                       tags$ul(
+                                         tags$li("A well is a DUC at snapshot date D if:"),
+                                         tags$li("• SpudDate is not NA and SpudDate ≤ D;"),
+                                         tags$li("• FirstProdDate is NA OR FirstProdDate > D (i.e., not onstream yet at D);"),
+                                         tags$li("• AbandonmentDate is NA OR AbandonmentDate > D;"),
+                                         tags$li("• Optional: if 'Exclude Confidential wells' is checked, wells with ConfidentialType ≠ NA are excluded.")
+                                       ),
+                                       tags$small("Grouping (Operator / Formation / Field / Province) uses columns already present in the well master, joined per your current logic.")
+                                     )
                               ),
                               column(8,
                                      h4(textOutput("duc_headline")),
@@ -1433,52 +1472,23 @@ server <- function(input, output, session) {
     }
   }
 
-  # --- PATCH 6B/6C: helpers for DUC calculations ---
-  is_duc_at <- function(dt, t, exclude_conf = TRUE) {
-    spud_ok <- !is.na(dt$SpudDate) & dt$SpudDate <= t
-    fpd_ok <- is.na(dt$FirstProdDate) | dt$FirstProdDate > t
-    abd_ok <- is.na(dt$AbandonmentDate) | dt$AbandonmentDate > t
-    conf_ok <- TRUE
-    if (exclude_conf && "ConfidentialType" %in% names(dt)) {
-      conf_vals <- dt$ConfidentialType
-      if (!is.character(conf_vals)) conf_vals <- as.character(conf_vals)
-      conf_ok <- is.na(conf_vals) | trimws(conf_vals) == ""
+  # --- DUC helpers ---
+  is_duc_at <- function(dt, snap_date, exclude_conf = TRUE) {
+    if (!nrow(dt)) return(logical(0))
+    d <- as.Date(snap_date)
+    spud <- as.Date(dt$SpudDate)
+    first_prod <- as.Date(dt$FirstProdDate)
+    abandon <- as.Date(dt$AbandonmentDate)
+    keep <- !is.na(spud) & spud <= d &
+      (is.na(first_prod) | first_prod > d) &
+      (is.na(abandon) | abandon > d)
+    if (exclude_conf) {
+      conf_vals <- if ("ConfidentialType" %in% names(dt)) dt$ConfidentialType else NA_character_
+      conf_vals <- as.character(conf_vals)
+      conf_keep <- is.na(conf_vals) | trimws(conf_vals) == "" | toupper(trimws(conf_vals)) == "NON-CONFIDENTIAL"
+      keep <- keep & conf_keep
     }
-    spud_ok & fpd_ok & abd_ok & conf_ok
-  }
-
-  duc_snapshot <- function(t_date, exclude_conf = TRUE) {
-    sfobj <- reactive_vals$wells_filtered_base
-    if (is.null(sfobj) || !inherits(sfobj, "sf") || nrow(sfobj) == 0) return(data.table::data.table())
-    dt <- data.table::as.data.table(sf::st_drop_geometry(sfobj))
-    needed <- c("SpudDate", "FirstProdDate", "AbandonmentDate")
-    if (!all(needed %in% names(dt))) return(data.table::data.table())
-    for (nm in needed) {
-      if (!inherits(dt[[nm]], "Date")) dt[, (nm) := as.Date(get(nm))]
-    }
-    if ("ConfidentialType" %in% names(dt) && !is.character(dt$ConfidentialType)) {
-      dt[, ConfidentialType := as.character(ConfidentialType)]
-    }
-    flags <- is_duc_at(dt, as.Date(t_date), exclude_conf = exclude_conf)
-    dt[flags]
-  }
-
-  safe_group_duc <- function(dt, grp) {
-    if (!nrow(dt) || is.null(grp)) {
-      return(data.table::data.table(Group = "(none)", DUCs = 0L))
-    }
-    grp <- as.character(grp)
-    if (!grp %in% names(dt)) {
-      return(data.table::data.table(Group = "(none)", DUCs = 0L))
-    }
-    tmp <- data.table::copy(dt)
-    tmp[, Group := {
-      vals <- get(grp)
-      if (!is.character(vals)) vals <- as.character(vals)
-      vals[is.na(vals) | trimws(vals) == ""] <- "(Unknown)"
-      vals
-    }]
-    tmp[, .(DUCs = .N), by = Group][order(-DUCs)]
+    keep
   }
   
   # Initial population of pickers (non-cascading)
@@ -1667,10 +1677,22 @@ server <- function(input, output, session) {
           Operator = dplyr::coalesce(operator_monthly, Operator_cap, "(Unknown)"),
           Facility = dplyr::coalesce(FacilityName, facility_id),
           FacilityType_display = dplyr::coalesce(FacilityType_cap, facility_subtype, facility_type),
-          utilization = dplyr::if_else(!is.na(monthly_capacity_e3m3) & monthly_capacity_e3m3 > 0,
-                                       throughput_gas_e3m3 / monthly_capacity_e3m3, NA_real_),
+          monthly_throughput_e3m3 = throughput_gas_e3m3,
+          utilization = dplyr::if_else(is.finite(monthly_capacity_e3m3) & monthly_capacity_e3m3 > 0,
+                                       monthly_throughput_e3m3 / monthly_capacity_e3m3, NA_real_),
           utilization_pct = utilization * 100
         )
+      if (!"monthly_capacity_e3m3" %in% names(gasplants_joined)) {
+        gasplants_joined$monthly_capacity_e3m3 <- rep(NA_real_, nrow(gasplants_joined))
+      }
+      if (!"monthly_throughput_e3m3" %in% names(gasplants_joined)) {
+        gasplants_joined$monthly_throughput_e3m3 <- rep(0, nrow(gasplants_joined))
+      }
+      gasplants_joined$monthly_throughput_e3m3[is.na(gasplants_joined$monthly_throughput_e3m3)] <- 0
+      if ("utilization" %in% names(gasplants_joined)) {
+        gasplants_joined$utilization[!is.finite(gasplants_joined$utilization)] <- NA_real_
+      }
+      gasplants_joined$utilization_pct <- gasplants_joined$utilization * 100
       gasplants_joined$Operator <- normalize_operator_label(gasplants_joined$Operator)
       gasplants_joined$FacilityType_display <- normalize_type_label(gasplants_joined$FacilityType_display)
       gasplants_joined$Facility[is.na(gasplants_joined$Facility) | gasplants_joined$Facility == ""] <- gasplants_joined$facility_id[is.na(gasplants_joined$Facility) | gasplants_joined$Facility == ""]
@@ -1713,18 +1735,42 @@ server <- function(input, output, session) {
       
       days_in_mo <- lubridate::days_in_month(gp$month)
       daily_capacity  <- ifelse(days_in_mo > 0, gp$monthly_capacity_e3m3 / days_in_mo, NA_real_)
-      daily_through   <- ifelse(days_in_mo > 0, gp$throughput_gas_e3m3 / days_in_mo, NA_real_)
+      daily_through   <- ifelse(days_in_mo > 0, gp$monthly_throughput_e3m3 / days_in_mo, NA_real_)
       radius <- scale_capacity_radius(daily_capacity)
       size_px <- ifelse(is.finite(radius), pmax(16, round(radius * 2)), 16)
       
       gp$Operator <- normalize_operator_label(gp$Operator)
       gp$FacilityType_display <- normalize_type_label(gp$FacilityType_display)
-      
-      operators <- sort(unique(gp$Operator))
-      operator_colors <- grDevices::hcl.colors(max(length(operators), 1), palette = "Dynamic")
-      color_lookup <- stats::setNames(operator_colors, operators)
-      marker_colors <- unname(color_lookup[gp$Operator])
-      marker_colors[is.na(marker_colors)] <- "#2c3e50"
+
+      legend_pal <- NULL
+      legend_values <- NULL
+      legend_title <- NULL
+      if (identical(input$gp_color_by, "util")) {
+        pal <- util_palette(gp$utilization)
+        gp$color_val <- pal(gp$utilization)
+        legend_title <- "Utilization"
+        legend_pal <- pal
+        legend_values <- gp$utilization
+      } else {
+        op_source <- if ("operator_monthly" %in% names(gp)) gp$operator_monthly else gp$Operator
+        if (is.null(op_source)) op_source <- gp$Operator
+        op_vals <- as.character(op_source)
+        if (!is.null(op_vals)) {
+          blank <- is.na(op_vals) | trimws(op_vals) == ""
+          if (any(blank)) {
+            op_vals[blank] <- gp$Operator[blank]
+          }
+        }
+        op <- normalize_operator_label(op_vals)
+        pal <- op_palette(sort(unique(op)))
+        gp$color_val <- pal(op)
+        legend_title <- "Operator"
+        legend_pal <- pal
+        legend_values <- op
+      }
+
+      marker_colors <- gp$color_val
+      marker_colors[is.na(marker_colors) | marker_colors == ""] <- "#2c3e50"
       
       type_shapes <- assign_shape_map(gp$FacilityType_display)
       shape_assignments <- unname(type_shapes$map[as.character(gp$FacilityType_display)])
@@ -1762,13 +1808,19 @@ server <- function(input, output, session) {
         options = leaflet::markerOptions(riseOnHover = TRUE)
       )
       
-      proxy <- proxy %>% addLegend(
-        position = "bottomright",
-        colors = operator_colors,
-        labels = operators,
-        title = "Operator",
-        opacity = 0.9
-      )
+      proxy <- proxy %>%
+        {
+          if (identical(input$gp_color_by, "util") && !is.null(legend_pal)) {
+            leaflet::addLegend(., position = "bottomright", pal = legend_pal, values = legend_values,
+                               title = legend_title, opacity = 0.9,
+                               labFormat = leaflet::labelFormat(digits = 0, suffix = "x"))
+          } else if (!is.null(legend_pal)) {
+            leaflet::addLegend(., position = "bottomright", pal = legend_pal, values = legend_values,
+                               title = legend_title, opacity = 0.9)
+          } else {
+            .
+          }
+        }
       
       shape_legend <- build_shape_legend(type_shapes$map)
       if (!is.null(shape_legend)) {
@@ -1781,7 +1833,7 @@ server <- function(input, output, session) {
       if (is.null(gp) || !nrow(gp)) return(DT::datatable(data.frame()))
       days_in_mo <- lubridate::days_in_month(gp$month)
       daily_capacity <- ifelse(days_in_mo > 0, gp$monthly_capacity_e3m3 / days_in_mo, NA_real_)
-      daily_through  <- ifelse(days_in_mo > 0, gp$throughput_gas_e3m3 / days_in_mo, NA_real_)
+      daily_through  <- ifelse(days_in_mo > 0, gp$monthly_throughput_e3m3 / days_in_mo, NA_real_)
       df <- tibble::tibble(
         Month = format(gp$month, "%Y-%m"),
         FacilityID = gp$facility_id,
@@ -2945,81 +2997,120 @@ server <- function(input, output, session) {
   )
 
   observeEvent(input$duc_apply, {
-    req(input$duc_date_a, input$duc_date_b)
-    snap_a <- as.Date(input$duc_date_a)
-    snap_b <- as.Date(input$duc_date_b)
+    req(!is.null(wells_sf), inherits(wells_sf, "sf"))
+    req(nrow(wells_sf) > 0)
+    req(!is.null(input$duc_dates))
+
+    dates <- sort(unique(as.Date(input$duc_dates)))
+    req(length(dates) >= 1)
+
+    gcol <- input$duc_group_by %||% "OperatorName"
     exclude_conf <- isTRUE(input$duc_exclude_conf)
-    grp <- input$duc_group_by %||% "OperatorName"
 
-    A <- duc_snapshot(snap_a, exclude_conf = exclude_conf)
-    B <- duc_snapshot(snap_b, exclude_conf = exclude_conf)
-
-    gA <- safe_group_duc(A, grp)
-    gB <- safe_group_duc(B, grp)
-
-    if (nrow(gA)) {
-      data.table::setnames(gA, c("Group", "DUCs"), c("Group", "DUCs_A"))
-    } else {
-      gA <- data.table::data.table(Group = character(0), DUCs_A = integer(0))
+    wx <- data.table::as.data.table(sf::st_drop_geometry(wells_sf))
+    cols_keep <- c("UWI", "OperatorName", "Formation", "FieldName", "ProvinceState",
+                   "SpudDate", "FirstProdDate", "AbandonmentDate", "ConfidentialType")
+    missing_cols <- setdiff(c("SpudDate", "FirstProdDate", "AbandonmentDate"), names(wx))
+    if (length(missing_cols)) {
+      reactive_vals$duc_comp <- data.table::data.table()
+      return(invisible(NULL))
     }
-    if (nrow(gB)) {
-      data.table::setnames(gB, c("Group", "DUCs"), c("Group", "DUCs_B"))
-    } else {
-      gB <- data.table::data.table(Group = character(0), DUCs_B = integer(0))
+    keep_cols <- intersect(cols_keep, names(wx))
+    wx <- wx[, ..keep_cols]
+    for (nm in intersect(c("SpudDate", "FirstProdDate", "AbandonmentDate"), names(wx))) {
+      if (!inherits(wx[[nm]], "Date")) {
+        wx[, (nm) := as.Date(get(nm))]
+      }
     }
-
-    comp <- merge(gA, gB, by = "Group", all = TRUE)
-    if (!nrow(comp)) {
-      comp <- data.table::data.table(Group = character(0), DUCs_A = integer(0), DUCs_B = integer(0), Delta = integer(0))
-    } else {
-      for (col in c("DUCs_A", "DUCs_B")) comp[is.na(get(col)), (col) := 0L]
-      comp[, Delta := as.integer(DUCs_B - DUCs_A)]
-      data.table::setorder(comp, -Delta, -DUCs_B)
+    if (!"ConfidentialType" %in% names(wx)) {
+      wx[, ConfidentialType := NA_character_]
+    } else if (!is.character(wx$ConfidentialType)) {
+      wx[, ConfidentialType := as.character(ConfidentialType)]
     }
 
-    reactive_vals$duc_comp <- comp
-  })
+    out_list <- lapply(dates, function(d) {
+      mask <- is_duc_at(wx, d, exclude_conf = exclude_conf)
+      if (!any(mask)) return(data.table::data.table())
+      subset_dt <- data.table::copy(wx[mask])
+      if (!gcol %in% names(subset_dt)) {
+        subset_dt[, (gcol) := "(Unknown)"]
+      }
+      subset_dt[, (gcol) := {
+        vals <- as.character(get(gcol))
+        vals[is.na(vals) | trimws(vals) == ""] <- "(Unknown)"
+        vals
+      }]
+      subset_dt[, .(DUC_Count = .N), by = ..gcol][, Snapshot := as.Date(d)][order(-DUC_Count)]
+    })
+
+    duc_comp <- data.table::rbindlist(out_list, use.names = TRUE, fill = TRUE)
+    if ("Snapshot" %in% names(duc_comp)) {
+      duc_comp[, Snapshot := as.Date(Snapshot)]
+    }
+    reactive_vals$duc_comp <- duc_comp
+  }, ignoreNULL = TRUE)
 
   output$duc_headline <- renderText({
-    comp <- reactive_vals$duc_comp
-    req(is.data.frame(comp))
-    total_a <- sum(comp$DUCs_A %||% 0, na.rm = TRUE)
-    total_b <- sum(comp$DUCs_B %||% 0, na.rm = TRUE)
-    delta <- total_b - total_a
-    glue::glue("DUCs at {input$duc_date_a} vs {input$duc_date_b} — total Δ = {scales::comma(delta)} (B − A)")
+    dt <- reactive_vals$duc_comp
+    if (!is.data.frame(dt) || !nrow(dt)) return("Compute DUCs to see results.")
+    snaps <- unique(dt$Snapshot)
+    paste0("DUC totals for ", length(snaps), " snapshot date(s)")
   })
 
   output$duc_bar_compare <- plotly::renderPlotly({
-    comp <- reactive_vals$duc_comp
-    req(is.data.frame(comp), nrow(comp) > 0)
-    top_n <- min(25, nrow(comp))
-    plot_dt <- data.table::copy(comp[1:top_n])
-    plot_dt[, Group := factor(Group, levels = rev(Group))]
-    plt <- ggplot(plot_dt, aes(x = Group, y = Delta, text = paste0("Snapshot A: ", DUCs_A, "\nSnapshot B: ", DUCs_B))) +
-      geom_col(fill = "#3182bd") +
-      coord_flip() +
-      labs(x = NULL, y = "Change in DUCs (B − A)") +
-      theme_minimal(base_size = 12)
-    plotly::ggplotly(plt, tooltip = c("y", "text"))
+    dt <- reactive_vals$duc_comp
+    req(is.data.frame(dt), nrow(dt) > 0)
+    grp_col <- input$duc_group_by %||% "OperatorName"
+    if (!grp_col %in% names(dt)) {
+      empty_plot <- ggplot2::ggplot() + ggplot2::labs(title = "No grouping column available.")
+      return(plotly::ggplotly(empty_plot))
+    }
+
+    totals <- dt[, .(Total = sum(DUC_Count, na.rm = TRUE)), by = ..grp_col]
+    totals <- totals[order(-Total)]
+    topN <- 20L
+    top_groups <- totals[[grp_col]][seq_len(min(nrow(totals), topN))]
+    plot_dt <- dt[get(grp_col) %in% top_groups]
+    if (!nrow(plot_dt)) {
+      empty_plot <- ggplot2::ggplot() + ggplot2::labs(title = "No DUCs for selected snapshots.")
+      return(plotly::ggplotly(empty_plot))
+    }
+
+    plot_dt[[grp_col]] <- factor(plot_dt[[grp_col]], levels = rev(unique(plot_dt[[grp_col]])))
+    p <- ggplot2::ggplot(plot_dt, ggplot2::aes_string(
+      x = grp_col, y = "DUC_Count", fill = "factor(Snapshot)"
+    )) +
+      ggplot2::geom_col(position = "dodge") +
+      ggplot2::labs(x = grp_col, y = "DUC count", fill = "Snapshot") +
+      ggplot2::coord_flip() +
+      ggplot2::theme_minimal(base_size = 12)
+    plotly::ggplotly(p)
   })
 
   output$duc_table <- DT::renderDT({
-    comp <- reactive_vals$duc_comp
-    req(is.data.frame(comp))
-    if (!nrow(comp)) {
+    dt <- reactive_vals$duc_comp
+    req(is.data.frame(dt))
+    if (!nrow(dt)) {
       return(DT::datatable(data.frame(Message = "No DUCs for selected snapshots."), options = list(searching = FALSE, paging = FALSE, info = FALSE), rownames = FALSE))
     }
-    DT::datatable(comp, rownames = FALSE, options = list(pageLength = 25, scrollX = TRUE))
+    dt_display <- data.table::copy(dt)
+    if ("Snapshot" %in% names(dt_display)) {
+      data.table::setnames(dt_display, "Snapshot", "SnapshotDate")
+    }
+    if (!"SnapshotDate" %in% names(dt_display)) {
+      dt_display[, SnapshotDate := as.Date(NA)]
+    }
+    DT::datatable(dt_display[order(SnapshotDate, -DUC_Count)], rownames = FALSE, options = list(pageLength = 25))
   })
 
   output$duc_download <- downloadHandler(
-    filename = function() sprintf("duc_compare_%s_vs_%s.csv", input$duc_date_a, input$duc_date_b),
+    filename = function() paste0("duc_snapshots_", Sys.Date(), ".csv"),
     content = function(file) {
-      comp <- reactive_vals$duc_comp
-      if (!is.data.frame(comp) || !nrow(comp)) {
-        data.table::fwrite(data.table::data.table(Message = "No DUC comparison available for download."), file)
+      dt <- reactive_vals$duc_comp
+      if (!is.data.frame(dt) || !nrow(dt)) {
+        data.table::fwrite(data.table::data.table(Message = "No DUC data available."), file)
       } else {
-        data.table::fwrite(data.table::as.data.table(comp), file)
+        data.table::fwrite(data.table::as.data.table(dt), file)
       }
     }
   )
