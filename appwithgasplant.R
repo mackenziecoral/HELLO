@@ -35,6 +35,7 @@ resolve_existing_dir <- function(candidates, fallback = ".") {
                                error = function(e) cand)
     if (dir.exists(candidate_path)) return(candidate_path)
   }
+
   tryCatch(normalizePath(fallback, winslash = "/", mustWork = FALSE), error = function(e) fallback)
 }
 
@@ -1090,6 +1091,15 @@ ui <- fluidPage(
                                   step = 1
                                 ),
 
+                                sliderInput(
+                                  "duc_max_months_cap",
+                                  "Max months between spud and first production to still call it 'DUC' (ignore wells that have been sitting longer than this many months without first production)",
+                                  min = 1,
+                                  max = 120,
+                                  value = 24,
+                                  step = 1
+                                ),
+
                                 checkboxInput(
                                   "duc_exclude_conf",
                                   "Exclude wells flagged Confidential",
@@ -1117,18 +1127,27 @@ ui <- fluidPage(
                                 ),
 
                                 br(),
+                                helpText("See below for the detailed DUC definition used in this tool."),
                                 wellPanel(
                                   tags$strong("How this tool defines a DUC"),
                                   tags$ul(
-                                    tags$li("Pick one or more Snapshot dates (month-end or any date)."),
-                                    tags$li("For each Snapshot date D, a well is counted as a DUC if:"),
-                                    tags$li("• SpudDate is not NA AND SpudDate ≤ D;"),
-                                    tags$li("• (FirstProdDate is NA) OR (FirstProdDate > D);"),
-                                    tags$li("• (AbandonmentDate is NA) OR (AbandonmentDate > D);"),
-                                    tags$li("• The well has existed at least 'Min days since spud' by D (so we're not counting wells still in active completion / flowback);"),
-                                    tags$li("• The well has existed no more than 'Max days allowed since spud' by D (so we drop multi-year zombies / uneconomic suspensions);"),
-                                    tags$li("• The well was spud within the last 'Recency window' months before D (keeps the backlog focused on current programs);"),
-                                    tags$li("• If 'Exclude wells flagged Confidential' is checked, wells with ConfidentialType set are dropped.")
+                                    tags$li("You pick one or more snapshot dates (these can be month-ends or any reference date)."),
+                                    tags$li(
+                                      "For each snapshot date D, a well is counted as a DUC if:",
+                                      tags$ul(
+                                        tags$li("The well has been spud on or before D (SpudDate ≤ D)."),
+                                        tags$li("The well has NOT started first production on/before D (FirstProdDate is blank OR FirstProdDate > D)."),
+                                        tags$li("The well is not abandoned as of D (AbandonmentDate is blank OR AbandonmentDate > D)."),
+                                        tags$li("The well has existed at least [Min days since spud] days by D."),
+                                        tags$li("The well has existed no more than [Max days allowed since spud] days by D (drops multi-year zombies / economic suspensions)."),
+                                        tags$li("The well was spud within the last [Recency window in months] months as of D (optional high-grading for current programs)."),
+                                        tags$li("The well has not exceeded [Max months between spud and first production] months with no first production (prevents including very old inventory)."),
+                                        tags$li("If 'Exclude wells flagged Confidential' is checked, wells flagged Confidential are dropped.")
+                                      )
+                                    ),
+                                    tags$li("Counts are grouped by the selected dimension (Operator, Province/State, Formation, Field, etc.)."),
+                                    tags$li("The bar chart shows DUC totals for each snapshot date side by side."),
+                                    tags$li("The downloadable detail table lists every UWI counted as a DUC at each snapshot date, along with key timestamps.")
                                   ),
                                   tags$small("Counts are grouped by the selected dimension (Operator, Formation, Field, Province). The bar chart shows absolute DUC totals per snapshot date, not just deltas.")
                                 )
@@ -1142,13 +1161,82 @@ ui <- fluidPage(
                                      hr(),
                                      h4("DUC detail (well-level)"),
                                      div(style = "margin-bottom:8px;",
-                                         downloadButton("duc_detail_download", "Download DUC detail (CSV)")
-                                     ),
-                                     DT::DTOutput("duc_detail_table")
+                                         downloadButton("download_duc_details_csv", "Download DUC detail (CSV)")
+                                      ),
+                                      DT::DTOutput("duc_detail_table")
                               )
                             )
-                   )
-                 )
+                  ),
+                  tabPanel("Shut-in Wells",
+                           fluidRow(
+                             column(
+                               width = 4,
+                               sliderInput(
+                                 "shutin_zero_prod_months",
+                                 "Only include wells that HAD production but have reported ZERO production for the last __ months",
+                                 min = 1,
+                                 max = 24,
+                                 value = 6,
+                                 step = 1
+                               ),
+                               checkboxInput(
+                                 "shutin_exclude_conf",
+                                 "Exclude wells flagged Confidential",
+                                 value = TRUE
+                               ),
+                               selectInput(
+                                 "shutin_group_by",
+                                 "Group shut-in counts by",
+                                 choices = c(
+                                   "Operator" = "OperatorName",
+                                   "Formation" = "Formation",
+                                   "Field" = "FieldName",
+                                   "Province/State" = "ProvinceState"
+                                 ),
+                                 selected = "OperatorName"
+                               ),
+                               actionButton(
+                                 "calculate_shutin",
+                                 "Calculate Shut-in Wells",
+                                 class = "btn-primary"
+                               ),
+                               br(),
+                               helpText("See below for the shut-in well definition applied."),
+                               wellPanel(
+                                 tags$strong("How this tool defines a Shut-in well"),
+                                 tags$ul(
+                                   tags$li("We look at the latest snapshot date you selected."),
+                                   tags$li(
+                                     "A well is considered Shut-in if:",
+                                     tags$ul(
+                                       tags$li("It HAS produced in the past (FirstProdDate is known and on/before the snapshot)."),
+                                       tags$li("It is not abandoned as of the snapshot (AbandonmentDate is blank OR in the future)."),
+                                       tags$li("It has reported ZERO production in EVERY month for the last [N] months (user-controlled).")
+                                     )
+                                   ),
+                                   tags$li("This is meant to approximate inactive-but-still-live wells (temporarily shut-in rather than fully abandoned)."),
+                                   tags$li("You can group shut-in counts by Operator, Province/State, Formation, etc."),
+                                   tags$li("The downloadable detail table lists each shut-in UWI with the date it last produced and how long it has been inactive.")
+                                 )
+                               )
+                             ),
+                             column(
+                               width = 8,
+                               h4(textOutput("shutin_headline")),
+                               plotOutput("shutin_bar_plot", height = "45vh"),
+                               br(),
+                               div(style = "margin-bottom:8px;",
+                                   downloadButton("shutin_summary_download", "Download shut-in summary (CSV)"),
+                                   downloadButton("shutin_detail_download", "Download shut-in detail (CSV)")
+                               ),
+                               DT::DTOutput("shutin_summary_table"),
+                               hr(),
+                               h4("Shut-in well detail"),
+                               DT::DTOutput("shutin_detail_table")
+                             )
+                           )
+                  )
+                )
         )
       )
     )
@@ -1194,7 +1282,9 @@ server <- function(input, output, session) {
     max_first_prod_date_overall = Sys.Date(),
     duc_comp = data.table::data.table(),
     duc_detail = data.table::data.table(),
-    duc_groups_available = character(0)
+    duc_groups_available = character(0),
+    shutin_summary = data.table::data.table(),
+    shutin_detail = data.table::data.table()
   )
 
   # --- PATCH 1A: safe boolean for "Oil + Condensate" toggle
@@ -1544,6 +1634,7 @@ server <- function(input, output, session) {
     min_hold_days      = 30L,
     max_hold_days      = 730L,
     recency_months     = 36L,
+    max_months_cap     = 24L,
     exclude_conf       = TRUE
   ) {
     d <- as.Date(snap_date)
@@ -1567,6 +1658,10 @@ server <- function(input, output, session) {
     recency_days <- as.numeric(recency_months) * 30.4375
     recent_enough <- !is.na(age_days) & (age_days <= recency_days)
 
+    # 4. Maximum months between spud and first production cap
+    cap_days <- as.numeric(max_months_cap) * 30.4375
+    within_month_cap <- !is.na(age_days) & (age_days <= cap_days)
+
     # Confidential filter
     if (exclude_conf) {
       conf_ok <- (is.na(dt$ConfidentialType) |
@@ -1582,6 +1677,7 @@ server <- function(input, output, session) {
       long_enough &
       not_too_old &
       recent_enough &
+      within_month_cap &
       conf_ok
   }
 
@@ -1591,6 +1687,7 @@ server <- function(input, output, session) {
     min_hold_days,
     max_hold_days,
     recency_months,
+    max_months_cap,
     exclude_conf,
     group_col
   ) {
@@ -1602,6 +1699,7 @@ server <- function(input, output, session) {
       min_hold_days  = min_hold_days,
       max_hold_days  = max_hold_days,
       recency_months = recency_months,
+      max_months_cap = max_months_cap,
       exclude_conf   = exclude_conf
     )
 
@@ -1614,12 +1712,16 @@ server <- function(input, output, session) {
     # audit columns
     out[, SnapshotDate := d]
     out[, DaysSinceSpud := as.numeric(SnapshotDate - SpudDate)]
+    out[, MonthsSinceSpud := round(DaysSinceSpud / 30.4375, 1)]
     out[, MinHold_OK := DaysSinceSpud >= as.numeric(min_hold_days)]
     out[, MaxHold_OK := DaysSinceSpud <= as.numeric(max_hold_days)]
     out[, InRecencyWindow := DaysSinceSpud <= as.numeric(recency_months) * 30.4375]
+    out[, MaxMonthsCap_OK := DaysSinceSpud <= as.numeric(max_months_cap) * 30.4375]
     out[, NotOnProd := (is.na(FirstProdDate) | FirstProdDate > SnapshotDate)]
     out[, NotAbandoned := (is.na(AbandonmentDate) | AbandonmentDate > SnapshotDate)]
     out[, ConfidentialFlag := ifelse(is.na(ConfidentialType) | ConfidentialType == "", "No", "Yes")]
+    out[, HasProducedYet := !is.na(FirstProdDate) & FirstProdDate <= SnapshotDate]
+    out[, IsCountedAsDUC := TRUE]
 
     # grouping label used downstream
     grp <- group_col
@@ -1631,6 +1733,7 @@ server <- function(input, output, session) {
     out[, .(
       UWI,
       Group,
+      GSL_UWI_Std,
       OperatorName,
       ProvinceState,
       Formation,
@@ -1640,13 +1743,50 @@ server <- function(input, output, session) {
       AbandonmentDate,
       SnapshotDate,
       DaysSinceSpud,
+      MonthsSinceSpud,
       MinHold_OK,
       MaxHold_OK,
       InRecencyWindow,
+      MaxMonthsCap_OK,
       NotOnProd,
       NotAbandoned,
-      ConfidentialFlag
+      ConfidentialFlag,
+      HasProducedYet,
+      IsCountedAsDUC
     )]
+  }
+
+  fetch_monthly_production_totals <- function(uwi_vec, date_start, date_end) {
+    if (length(uwi_vec) == 0) return(data.table::data.table())
+    dt <- fetch_monthly_gor(uwi_vec, date_start, date_end, use_cnd = TRUE)
+    if (is.null(dt) || !nrow(dt)) return(data.table::data.table())
+    if (!"GSL_UWI_STD" %in% names(dt)) return(data.table::data.table())
+
+    prod_dt <- data.table::copy(dt)
+    if (!"PROD_DATE" %in% names(prod_dt)) return(data.table::data.table())
+
+    prod_dt[, PROD_MONTH := lubridate::floor_date(PROD_DATE, "month")]
+    name_map <- list(
+      OilBBL = intersect(c("OilBBL", "OILBBL"), names(prod_dt)),
+      CndBBL = intersect(c("CndBBL", "CNDBBL"), names(prod_dt)),
+      GasMCF = intersect(c("GasMCF", "GASMCF"), names(prod_dt))
+    )
+    for (nm in names(name_map)) {
+      src <- setdiff(name_map[[nm]], nm)
+      if (length(src) > 0) data.table::setnames(prod_dt, old = src[1], new = nm, skip_absent = TRUE)
+    }
+    for (col in c("OilBBL", "CndBBL", "GasMCF")) {
+      if (!col %in% names(prod_dt)) prod_dt[, (col) := 0]
+      if (!is.numeric(prod_dt[[col]])) prod_dt[, (col) := as.numeric(get(col))]
+      prod_dt[is.na(get(col)), (col) := 0]
+    }
+    prod_dt[, TotalVolume := OilBBL + CndBBL + GasMCF]
+    prod_dt[, .(
+      OilBBL = sum(OilBBL, na.rm = TRUE),
+      CndBBL = sum(CndBBL, na.rm = TRUE),
+      GasMCF = sum(GasMCF, na.rm = TRUE),
+      TotalVolume = sum(TotalVolume, na.rm = TRUE)
+    ), by = .(GSL_UWI_STD, PROD_MONTH)]
   }
   
   # Initial population of pickers (non-cascading)
@@ -3170,20 +3310,34 @@ server <- function(input, output, session) {
     min_hold_days <- as.numeric(input$duc_min_hold_days %||% 30)
     max_hold_days  <- as.numeric(input$duc_max_hold_days %||% 730)
     recency_months <- as.numeric(input$duc_spud_recency_months %||% 36)
+    max_months_cap <- as.numeric(input$duc_max_months_cap %||% 24)
     exclude_conf  <- isTRUE(input$duc_exclude_conf)
 
-    # strip geometry and grab only the columns we need
-    wx <- data.table::as.data.table(sf::st_drop_geometry(wells_sf_global))[
+    base_sf <- reactive_vals$wells_filtered_base
+    if (is.null(base_sf) || !inherits(base_sf, "sf") || nrow(base_sf) == 0) {
+      base_sf <- wells_sf_global
+    }
+    req(inherits(base_sf, "sf"), nrow(base_sf) > 0)
+
+    wx_raw <- data.table::as.data.table(sf::st_drop_geometry(base_sf))
+    if ("GSL_UWI_STD" %in% names(wx_raw) && !"GSL_UWI_Std" %in% names(wx_raw)) data.table::setnames(wx_raw, "GSL_UWI_STD", "GSL_UWI_Std")
+    if ("GSL_UWI" %in% names(wx_raw) && !"GSL_UWI_Std" %in% names(wx_raw)) wx_raw[, GSL_UWI_Std := standardize_uwi(GSL_UWI)]
+    if (!"GSL_UWI_Std" %in% names(wx_raw)) wx_raw[, GSL_UWI_Std := NA_character_]
+    if (!"UWI" %in% names(wx_raw)) wx_raw[, UWI := GSL_UWI_Std]
+    if (!"ConfidentialType" %in% names(wx_raw)) wx_raw[, ConfidentialType := NA_character_]
+
+    wx <- wx_raw[
       , .(
-          UWI,
-          OperatorName    = OperatorName %||% NA_character_,
-          Formation       = Formation %||% NA_character_,
-          FieldName       = FieldName %||% NA_character_,
-          ProvinceState   = ProvinceState %||% NA_character_,
-          SpudDate        = as.Date(SpudDate),
-          FirstProdDate   = as.Date(FirstProdDate),
-          AbandonmentDate = as.Date(AbandonmentDate),
-          ConfidentialType= ConfidentialType %||% NA_character_
+          UWI               = UWI %||% NA_character_,
+          GSL_UWI_Std       = GSL_UWI_Std %||% NA_character_,
+          OperatorName      = OperatorName %||% NA_character_,
+          Formation         = Formation %||% NA_character_,
+          FieldName         = FieldName %||% NA_character_,
+          ProvinceState     = ProvinceState %||% NA_character_,
+          SpudDate          = as.Date(SpudDate),
+          FirstProdDate     = as.Date(FirstProdDate),
+          AbandonmentDate   = as.Date(AbandonmentDate),
+          ConfidentialType  = ConfidentialType %||% NA_character_
         )
     ]
 
@@ -3195,6 +3349,7 @@ server <- function(input, output, session) {
         min_hold_days   = min_hold_days,
         max_hold_days   = max_hold_days,
         recency_months  = recency_months,
+        max_months_cap  = max_months_cap,
         exclude_conf    = exclude_conf,
         group_col       = grp_col
       )
@@ -3336,7 +3491,7 @@ server <- function(input, output, session) {
     )
   })
 
-  output$duc_detail_download <- downloadHandler(
+  output$download_duc_details_csv <- downloadHandler(
     filename = function() paste0("duc_detail_", Sys.Date(), ".csv"),
     content = function(file) {
       dt <- reactive_vals$duc_detail
@@ -3346,6 +3501,204 @@ server <- function(input, output, session) {
       }
       if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
         dt <- dt[Group %in% input$duc_group_filter]
+      }
+      data.table::fwrite(dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, UWI)], file)
+    }
+  )
+
+  observeEvent(input$calculate_shutin, {
+    req(wells_sf_global)
+    req(nrow(wells_sf_global) > 0)
+
+    snap_dates <- sort(unique(as.Date(input$duc_dates)))
+    req(length(snap_dates) > 0)
+    shutin_snapshot <- max(snap_dates, na.rm = TRUE)
+
+    zero_months <- as.numeric(input$shutin_zero_prod_months %||% 6)
+    if (!is.finite(zero_months) || zero_months < 1) zero_months <- 1
+    exclude_conf_shutin <- isTRUE(input$shutin_exclude_conf)
+
+    grp_col <- input$shutin_group_by
+    if (is.null(grp_col) || !(grp_col %in% c("OperatorName", "Formation", "FieldName", "ProvinceState"))) {
+      grp_col <- "OperatorName"
+    }
+
+    base_sf <- reactive_vals$wells_filtered_base
+    if (is.null(base_sf) || !inherits(base_sf, "sf") || nrow(base_sf) == 0) {
+      base_sf <- wells_sf_global
+    }
+    req(inherits(base_sf, "sf"), nrow(base_sf) > 0)
+
+    wx_raw <- data.table::as.data.table(sf::st_drop_geometry(base_sf))
+    if ("GSL_UWI_STD" %in% names(wx_raw) && !"GSL_UWI_Std" %in% names(wx_raw)) data.table::setnames(wx_raw, "GSL_UWI_STD", "GSL_UWI_Std")
+    if ("GSL_UWI" %in% names(wx_raw) && !"GSL_UWI_Std" %in% names(wx_raw)) wx_raw[, GSL_UWI_Std := standardize_uwi(GSL_UWI)]
+    if (!"GSL_UWI_Std" %in% names(wx_raw)) wx_raw[, GSL_UWI_Std := NA_character_]
+    if (!"UWI" %in% names(wx_raw)) wx_raw[, UWI := GSL_UWI_Std]
+    if (!"ConfidentialType" %in% names(wx_raw)) wx_raw[, ConfidentialType := NA_character_]
+
+    wx <- wx_raw[
+      , .(
+          UWI               = UWI %||% NA_character_,
+          GSL_UWI_Std       = GSL_UWI_Std %||% NA_character_,
+          OperatorName      = OperatorName %||% NA_character_,
+          Formation         = Formation %||% NA_character_,
+          FieldName         = FieldName %||% NA_character_,
+          ProvinceState     = ProvinceState %||% NA_character_,
+          SpudDate          = as.Date(SpudDate),
+          FirstProdDate     = as.Date(FirstProdDate),
+          AbandonmentDate   = as.Date(AbandonmentDate),
+          ConfidentialType  = ConfidentialType %||% NA_character_
+        )
+    ]
+
+    if (!grp_col %in% names(wx)) {
+      wx[, Group := "(Unknown)"]
+    } else {
+      wx[, Group := {
+        val <- get(grp_col)
+        ifelse(is.na(val) | val == "", "(Unknown)", as.character(val))
+      }]
+    }
+
+    uwi_vec <- unique(stats::na.omit(wx$GSL_UWI_Std))
+    if (length(uwi_vec) == 0) {
+      reactive_vals$shutin_summary <- data.table::data.table()
+      reactive_vals$shutin_detail <- data.table::data.table()
+      showNotification("No wells available with valid IDs for shut-in calculation.", type = "warning", duration = 5)
+      return()
+    }
+
+    snapshot_month <- lubridate::floor_date(shutin_snapshot, "month")
+    month_sequence <- seq(snapshot_month %m-% lubridate::months(zero_months - 1), snapshot_month, by = "month")
+    earliest_needed <- suppressWarnings(min(wx$SpudDate, na.rm = TRUE))
+    lookback_months <- max(zero_months + 24, 60)
+    candidate_start <- snapshot_month %m-% lubridate::months(lookback_months)
+    if (!is.finite(earliest_needed)) {
+      date_start <- candidate_start
+    } else {
+      date_start <- suppressWarnings(min(earliest_needed, candidate_start, na.rm = TRUE))
+    }
+    if (!is.finite(date_start)) date_start <- candidate_start
+    if (date_start < as.Date("1900-01-01")) date_start <- as.Date("1900-01-01")
+
+    prod_totals <- fetch_monthly_production_totals(uwi_vec, date_start, shutin_snapshot)
+    if (!nrow(prod_totals)) {
+      reactive_vals$shutin_summary <- data.table::data.table()
+      reactive_vals$shutin_detail <- data.table::data.table()
+      showNotification("No production history available for selected wells.", type = "warning", duration = 5)
+      return()
+    }
+
+    zero_window_dt <- data.table::CJ(GSL_UWI_STD = uwi_vec, PROD_MONTH = month_sequence, unique = TRUE)
+    zero_window_dt <- merge(zero_window_dt, prod_totals[, .(GSL_UWI_STD, PROD_MONTH, TotalVolume)],
+                            by = c("GSL_UWI_STD", "PROD_MONTH"), all.x = TRUE)
+    zero_window_dt[is.na(TotalVolume), TotalVolume := 0]
+    zero_check <- zero_window_dt[, .(ZeroStreakAllZero = all(TotalVolume <= 0, na.rm = TRUE)), by = GSL_UWI_STD]
+
+    last_prod <- prod_totals[TotalVolume > 0, .(LastProdMonth = max(PROD_MONTH, na.rm = TRUE)), by = GSL_UWI_STD]
+    if (nrow(last_prod)) {
+      last_prod[, MonthsSinceLastProd := round(lubridate::time_length(lubridate::interval(LastProdMonth, shutin_snapshot), "month"), 1)]
+    }
+
+    shutin_dt <- merge(wx, zero_check, by.x = "GSL_UWI_Std", by.y = "GSL_UWI_STD", all.x = TRUE)
+    shutin_dt <- merge(shutin_dt, last_prod, by.x = "GSL_UWI_Std", by.y = "GSL_UWI_STD", all.x = TRUE)
+    shutin_dt[is.na(ZeroStreakAllZero), ZeroStreakAllZero := FALSE]
+    shutin_dt[, ConfidentialFlag := ifelse(is.na(ConfidentialType) | ConfidentialType == "", "No", "Yes")]
+    if (exclude_conf_shutin) {
+      shutin_dt <- shutin_dt[ConfidentialFlag == "No"]
+    }
+
+    shutin_dt[, HasProductionHistory := !is.na(FirstProdDate) & FirstProdDate <= shutin_snapshot]
+    shutin_dt[, NotAbandoned := is.na(AbandonmentDate) | AbandonmentDate > shutin_snapshot]
+    shutin_dt[, LastReportedProdMonth := as.Date(LastProdMonth)]
+    shutin_dt[!is.na(LastReportedProdMonth), MonthsSinceLastProd := round(lubridate::time_length(lubridate::interval(LastReportedProdMonth, shutin_snapshot), "month"), 1)]
+    shutin_dt[is.na(MonthsSinceLastProd), MonthsSinceLastProd := NA_real_]
+    shutin_dt[, ShutIn := ZeroStreakAllZero & HasProductionHistory & NotAbandoned & !is.na(LastReportedProdMonth)]
+    shutin_dt[, SnapshotDate := shutin_snapshot]
+    shutin_dt[, ZeroProdWindowMonths := zero_months]
+
+    shutin_detail <- shutin_dt[ShutIn == TRUE,
+                               .(SnapshotDate,
+                                 UWI,
+                                 GSL_UWI_Std,
+                                 Group,
+                                 OperatorName,
+                                 ProvinceState,
+                                 Formation,
+                                 FieldName,
+                                 SpudDate,
+                                 FirstProdDate,
+                                 AbandonmentDate,
+                                 LastReportedProdMonth,
+                                 MonthsSinceLastProd,
+                                 ConfidentialFlag,
+                                 ZeroProdWindowMonths,
+                                 ShutIn = TRUE)]
+
+    if (nrow(shutin_detail)) {
+      shutin_summary <- shutin_detail[, .(ShutIn_Count = .N), by = .(Group, SnapshotDate)][order(-ShutIn_Count)]
+    } else {
+      shutin_summary <- data.table::data.table(Group = character(0), SnapshotDate = as.Date(character(0)), ShutIn_Count = integer(0))
+    }
+
+    reactive_vals$shutin_detail <- shutin_detail
+    reactive_vals$shutin_summary <- shutin_summary
+  })
+
+  output$shutin_headline <- renderText({
+    dt <- reactive_vals$shutin_summary
+    if (is.null(dt) || !nrow(dt)) return("No shut-in results yet. Select filters and click Calculate.")
+    total <- dt[, .(TotalShutIn = sum(ShutIn_Count, na.rm = TRUE)), by = SnapshotDate]
+    paste0(
+      "Shut-in counts for ", nrow(total), " snapshot(s). ",
+      paste0(format(total$SnapshotDate, "%Y-%m-%d"), ": ", total$TotalShutIn, " wells", collapse = " | ")
+    )
+  })
+
+  output$shutin_bar_plot <- renderPlot({
+    dt <- reactive_vals$shutin_summary
+    req(!is.null(dt), nrow(dt) > 0)
+    p <- ggplot2::ggplot(dt, ggplot2::aes(x = Group, y = ShutIn_Count, fill = as.factor(SnapshotDate))) +
+      ggplot2::geom_col(position = "dodge") +
+      ggplot2::coord_flip() +
+      ggplot2::labs(x = NULL, y = "Shut-in well count", fill = "Snapshot") +
+      ggplot2::theme_minimal(base_size = 12)
+    print(p)
+  })
+
+  output$shutin_summary_table <- DT::renderDT({
+    dt <- reactive_vals$shutin_summary
+    req(!is.null(dt), nrow(dt) > 0)
+    DT::datatable(dt[order(SnapshotDate, -ShutIn_Count)], rownames = FALSE, options = list(pageLength = 25, scrollX = TRUE))
+  })
+
+  output$shutin_detail_table <- DT::renderDT({
+    dt <- reactive_vals$shutin_detail
+    req(!is.null(dt), nrow(dt) > 0)
+    DT::datatable(dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, UWI)],
+                  rownames = FALSE,
+                  options = list(pageLength = 25, scrollX = TRUE))
+  })
+
+  output$shutin_summary_download <- downloadHandler(
+    filename = function() paste0("shutin_summary_", Sys.Date(), ".csv"),
+    content = function(file) {
+      dt <- reactive_vals$shutin_summary
+      if (is.null(dt) || !nrow(dt)) {
+        data.table::fwrite(data.table::data.table(), file)
+        return()
+      }
+      data.table::fwrite(dt[order(SnapshotDate, -ShutIn_Count)], file)
+    }
+  )
+
+  output$shutin_detail_download <- downloadHandler(
+    filename = function() paste0("shutin_detail_", Sys.Date(), ".csv"),
+    content = function(file) {
+      dt <- reactive_vals$shutin_detail
+      if (is.null(dt) || !nrow(dt)) {
+        data.table::fwrite(data.table::data.table(), file)
+        return()
       }
       data.table::fwrite(dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, UWI)], file)
     }
