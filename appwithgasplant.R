@@ -1138,7 +1138,13 @@ ui <- fluidPage(
                                      plotlyOutput("duc_bar_compare", height = "45vh"),
                                      br(),
                                      downloadButton("duc_download", "Download DUC table (CSV)"),
-                                     DTOutput("duc_table")
+                                     DTOutput("duc_table"),
+                                     hr(),
+                                     h4("DUC detail (well-level)"),
+                                     div(style = "margin-bottom:8px;",
+                                         downloadButton("duc_detail_download", "Download DUC detail (CSV)")
+                                     ),
+                                     DT::DTOutput("duc_detail_table")
                               )
                             )
                    )
@@ -1187,6 +1193,7 @@ server <- function(input, output, session) {
     min_first_prod_date_overall = as.Date("1900-01-01"),
     max_first_prod_date_overall = Sys.Date(),
     duc_comp = data.table::data.table(),
+    duc_detail = data.table::data.table(),
     duc_groups_available = character(0)
   )
 
@@ -1578,55 +1585,68 @@ server <- function(input, output, session) {
       conf_ok
   }
 
-  # Summarize DUC counts for a single snapshot date
-  duc_summary_for_date <- function(
+  duc_detail_for_date <- function(
     wx_dt,
     snap_date,
-    group_col,
     min_hold_days,
     max_hold_days,
     recency_months,
-    exclude_conf
+    exclude_conf,
+    group_col
   ) {
-    # wx_dt MUST include these cols:
-    # UWI, OperatorName, Formation, FieldName, ProvinceState,
-    # SpudDate, FirstProdDate, AbandonmentDate, ConfidentialType
+    d <- as.Date(snap_date)
+
     keep_mask <- is_duc_at(
       dt             = wx_dt,
-      snap_date      = snap_date,
+      snap_date      = d,
       min_hold_days  = min_hold_days,
       max_hold_days  = max_hold_days,
       recency_months = recency_months,
       exclude_conf   = exclude_conf
     )
+
     if (!any(keep_mask, na.rm = TRUE)) {
-      return(data.table::data.table(
-        Group = character(0),
-        DUC_Count = integer(0),
-        SnapshotDate = as.Date(character(0))
-      ))
+      return(data.table::data.table())
     }
 
-    # select grouping col dynamically, safely
-    grp_col <- group_col
-    tmp <- wx_dt[keep_mask,
-                 .(GroupVal = get(grp_col)),
-    ]
+    out <- data.table::copy(wx_dt[keep_mask])
 
-    tmp[, GroupVal := ifelse(
-      is.na(GroupVal) | GroupVal == "",
-      "(Unknown)",
-      as.character(GroupVal)
+    # audit columns
+    out[, SnapshotDate := d]
+    out[, DaysSinceSpud := as.numeric(SnapshotDate - SpudDate)]
+    out[, MinHold_OK := DaysSinceSpud >= as.numeric(min_hold_days)]
+    out[, MaxHold_OK := DaysSinceSpud <= as.numeric(max_hold_days)]
+    out[, InRecencyWindow := DaysSinceSpud <= as.numeric(recency_months) * 30.4375]
+    out[, NotOnProd := (is.na(FirstProdDate) | FirstProdDate > SnapshotDate)]
+    out[, NotAbandoned := (is.na(AbandonmentDate) | AbandonmentDate > SnapshotDate)]
+    out[, ConfidentialFlag := ifelse(is.na(ConfidentialType) | ConfidentialType == "", "No", "Yes")]
+
+    # grouping label used downstream
+    grp <- group_col
+    out[, Group := {
+      val <- get(grp)
+      ifelse(is.na(val) | val == "", "(Unknown)", as.character(val))
+    }]
+
+    out[, .(
+      UWI,
+      Group,
+      OperatorName,
+      ProvinceState,
+      Formation,
+      FieldName,
+      SpudDate,
+      FirstProdDate,
+      AbandonmentDate,
+      SnapshotDate,
+      DaysSinceSpud,
+      MinHold_OK,
+      MaxHold_OK,
+      InRecencyWindow,
+      NotOnProd,
+      NotAbandoned,
+      ConfidentialFlag
     )]
-
-    out <- tmp[
-      , .(DUC_Count = .N),
-      by = .(GroupVal)
-    ]
-    out[, SnapshotDate := as.Date(snap_date)]
-    data.table::setnames(out, "GroupVal", "Group")
-
-    out[order(-DUC_Count)]
   }
   
   # Initial population of pickers (non-cascading)
@@ -3167,32 +3187,35 @@ server <- function(input, output, session) {
         )
     ]
 
-    # loop snapshots, bind
-    snap_list <- lapply(
+    detail_list <- lapply(
       snap_dates,
-      function(sd) {
-        duc_summary_for_date(
-          wx_dt = wx,
-          snap_date = sd,
-          group_col = grp_col,
-          min_hold_days = min_hold_days,
-          max_hold_days = max_hold_days,
-          recency_months = recency_months,
-          exclude_conf = exclude_conf
-        )
-      }
+      function(sd) duc_detail_for_date(
+        wx_dt           = wx,
+        snap_date       = sd,
+        min_hold_days   = min_hold_days,
+        max_hold_days   = max_hold_days,
+        recency_months  = recency_months,
+        exclude_conf    = exclude_conf,
+        group_col       = grp_col
+      )
     )
-    duc_comp_dt <- data.table::rbindlist(snap_list, use.names = TRUE, fill = TRUE)
+    duc_detail_dt <- data.table::rbindlist(detail_list, use.names = TRUE, fill = TRUE)
 
-    # store in a reactiveValues slot called duc_comp (create reactive_vals$duc_comp if needed)
+    reactive_vals$duc_detail <- duc_detail_dt
+
+    if (nrow(duc_detail_dt)) {
+      duc_comp_dt <- duc_detail_dt[, .(DUC_Count = .N), by = .(Group, SnapshotDate)][order(SnapshotDate, -DUC_Count)]
+    } else {
+      duc_comp_dt <- data.table::data.table(Group = character(0), DUC_Count = integer(0), SnapshotDate = as.Date(character(0)))
+    }
+
     reactive_vals$duc_comp <- duc_comp_dt
-    all_groups <- sort(unique(duc_comp_dt$Group))
-    reactive_vals$duc_groups_available <- all_groups
+    reactive_vals$duc_groups_available <- if (nrow(duc_comp_dt)) sort(unique(duc_comp_dt$Group)) else character(0)
   })
 
   output$duc_group_filter_ui <- renderUI({
     groups <- reactive_vals$duc_groups_available
-    req(groups)
+    req(!is.null(groups), length(groups) > 0)
     selectizeInput(
       "duc_group_filter",
       label = paste0("Filter ", ifelse(input$duc_group_by == "ProvinceState", "provinces", "groups"), " to display"),
@@ -3274,12 +3297,57 @@ server <- function(input, output, session) {
   })
 
   output$duc_download <- downloadHandler(
-    filename = function() {
-      paste0("duc_snapshots_", Sys.Date(), ".csv")
-    },
+    filename = function() paste0("duc_summary_", Sys.Date(), ".csv"),
     content = function(file) {
-      dt <- reactive_vals$duc_comp
-      data.table::fwrite(dt, file)
+      sum_dt <- reactive_vals$duc_comp
+      det_dt <- reactive_vals$duc_detail
+      if (is.null(sum_dt) || !nrow(sum_dt)) {
+        data.table::fwrite(sum_dt, file)
+        return()
+      }
+      if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
+        sum_dt <- sum_dt[Group %in% input$duc_group_filter]
+        if (!is.null(det_dt) && nrow(det_dt) > 0) {
+          det_dt <- det_dt[Group %in% input$duc_group_filter]
+        }
+      }
+      if (!is.null(det_dt) && nrow(det_dt) > 0) {
+        uwis <- det_dt[, .(UWI_List = paste(sort(unique(UWI)), collapse = "|")), by = .(Group, SnapshotDate)]
+        out <- merge(sum_dt, uwis, by = c("Group", "SnapshotDate"), all.x = TRUE)
+      } else {
+        out <- sum_dt
+      }
+      data.table::fwrite(out[order(SnapshotDate, -DUC_Count)], file)
+    }
+  )
+
+  output$duc_detail_table <- DT::renderDT({
+    dt <- reactive_vals$duc_detail
+    req(!is.null(dt), nrow(dt) > 0)
+    if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
+      dt <- dt[Group %in% input$duc_group_filter]
+    }
+    req(nrow(dt) > 0)
+    dt <- dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, UWI)]
+    DT::datatable(
+      dt,
+      rownames = FALSE,
+      options = list(pageLength = 25, scrollX = TRUE)
+    )
+  })
+
+  output$duc_detail_download <- downloadHandler(
+    filename = function() paste0("duc_detail_", Sys.Date(), ".csv"),
+    content = function(file) {
+      dt <- reactive_vals$duc_detail
+      if (is.null(dt) || !nrow(dt)) {
+        data.table::fwrite(data.table::data.table(), file)
+        return()
+      }
+      if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
+        dt <- dt[Group %in% input$duc_group_filter]
+      }
+      data.table::fwrite(dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, UWI)], file)
     }
   )
 
