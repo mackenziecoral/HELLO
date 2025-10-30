@@ -1167,74 +1167,50 @@ ui <- fluidPage(
                               )
                             )
                   ),
-                  tabPanel("Shut-in Wells",
-                           fluidRow(
-                             column(
-                               width = 4,
-                               sliderInput(
-                                 "shutin_zero_prod_months",
-                                 "Only include wells that HAD production but have reported ZERO production for the last __ months",
-                                 min = 1,
-                                 max = 24,
-                                 value = 6,
-                                 step = 1
-                               ),
-                               checkboxInput(
-                                 "shutin_exclude_conf",
-                                 "Exclude wells flagged Confidential",
-                                 value = TRUE
-                               ),
-                               selectInput(
-                                 "shutin_group_by",
-                                 "Group shut-in counts by",
-                                 choices = c(
-                                   "Operator" = "OperatorName",
-                                   "Formation" = "Formation",
-                                   "Field" = "FieldName",
-                                   "Province/State" = "ProvinceState"
-                                 ),
-                                 selected = "OperatorName"
-                               ),
-                               actionButton(
-                                 "calculate_shutin",
-                                 "Calculate Shut-in Wells",
-                                 class = "btn-primary"
-                               ),
-                               br(),
-                               helpText("See below for the shut-in well definition applied."),
-                               wellPanel(
-                                 tags$strong("How this tool defines a Shut-in well"),
-                                 tags$ul(
-                                   tags$li("We look at the latest snapshot date you selected."),
-                                   tags$li(
-                                     "A well is considered Shut-in if:",
-                                     tags$ul(
-                                       tags$li("It HAS produced in the past (FirstProdDate is known and on/before the snapshot)."),
-                                       tags$li("It is not abandoned as of the snapshot (AbandonmentDate is blank OR in the future)."),
-                                       tags$li("It has reported ZERO production in EVERY month for the last [N] months (user-controlled).")
-                                     )
-                                   ),
-                                   tags$li("This is meant to approximate inactive-but-still-live wells (temporarily shut-in rather than fully abandoned)."),
-                                   tags$li("You can group shut-in counts by Operator, Province/State, Formation, etc."),
-                                   tags$li("The downloadable detail table lists each shut-in UWI with the date it last produced and how long it has been inactive.")
-                                 )
-                               )
-                             ),
-                             column(
-                               width = 8,
-                               h4(textOutput("shutin_headline")),
-                               plotOutput("shutin_bar_plot", height = "45vh"),
-                               br(),
-                               div(style = "margin-bottom:8px;",
-                                   downloadButton("shutin_summary_download", "Download shut-in summary (CSV)"),
-                                   downloadButton("shutin_detail_download", "Download shut-in detail (CSV)")
-                               ),
-                               DT::DTOutput("shutin_summary_table"),
-                               hr(),
-                               h4("Shut-in well detail"),
-                               DT::DTOutput("shutin_detail_table")
-                             )
-                           )
+                  tabPanel(
+                    "Shut-in Wells",
+                    fluidRow(
+                      column(
+                        width = 3,
+                        dateInput(
+                          "shutin_snapshot_date",
+                          "Snapshot date (as of):",
+                          value = Sys.Date(),
+                          min = as.Date("2015-01-01"),
+                          max = Sys.Date()
+                        ),
+                        numericInput(
+                          "shutin_zero_prod_months",
+                          "No production for at least (months):",
+                          value = 6,
+                          min = 1,
+                          max = 36,
+                          step = 1
+                        ),
+                        actionButton(
+                          "calculate_shutin",
+                          "Calculate shut-in wells",
+                          class = "btn-primary"
+                        ),
+                        helpText(
+                          "Definition of 'shut-in' here:
+",
+                          "1) Well has a FirstProdDate (it actually produced at some point).
+",
+                          "2) AbandonmentDate is NA OR after the snapshot date.
+",
+                          "3) No measured production in the last X months before the snapshot date.
+",
+                          "We flag the last month a well had ANY volume (oil+gas+condensate etc.).",
+                          "If that last-prod month is older than the cutoff, it's counted as shut-in."
+                        )
+                      ),
+                      column(
+                        width = 9,
+                        plotOutput("shutin_plot", height = 350),
+                        DTOutput("shutin_table")
+                      )
+                    )
                   )
                 )
         )
@@ -3507,202 +3483,150 @@ server <- function(input, output, session) {
   )
 
   observeEvent(input$calculate_shutin, {
-    req(wells_sf_global)
-    req(nrow(wells_sf_global) > 0)
+    req(input$shutin_snapshot_date)
+    req(input$shutin_zero_prod_months)
 
-    snap_dates <- sort(unique(as.Date(input$duc_dates)))
-    req(length(snap_dates) > 0)
-    shutin_snapshot <- max(snap_dates, na.rm = TRUE)
+    snapshot_date <- as.Date(input$shutin_snapshot_date)
+    cutoff_date <- snapshot_date - lubridate::days(30 * as.numeric(input$shutin_zero_prod_months))
 
-    zero_months <- as.numeric(input$shutin_zero_prod_months %||% 6)
-    if (!is.finite(zero_months) || zero_months < 1) zero_months <- 1
-    exclude_conf_shutin <- isTRUE(input$shutin_exclude_conf)
-
-    grp_col <- input$shutin_group_by
-    if (is.null(grp_col) || !(grp_col %in% c("OperatorName", "Formation", "FieldName", "ProvinceState"))) {
-      grp_col <- "OperatorName"
+    if (is.null(con) || !DBI::dbIsValid(con)) {
+      con <<- connect_to_db()
     }
 
-    base_sf <- reactive_vals$wells_filtered_base
-    if (is.null(base_sf) || !inherits(base_sf, "sf") || nrow(base_sf) == 0) {
-      base_sf <- wells_sf_global
+    prod_sql <- glue::glue_sql("
+    SELECT
+      p.GSL_UWI,
+      p.PROD_MONTH,
+      p.OIL_BBL,
+      p.COND_BBL,
+      p.GAS_MCF
+    FROM PDEN_MONTHLY p
+    WHERE p.PROD_MONTH <= {snapshot_date}
+  ", .con = con)
+
+    prod_raw <- tryCatch({
+      DBI::dbGetQuery(con, prod_sql)
+    }, error = function(e) {
+      message('ERROR pulling production: ', e$message)
+      data.frame()
+    })
+
+    prod_dt <- data.table::as.data.table(prod_raw)
+
+    if (nrow(prod_dt) > 0) {
+      if (!inherits(prod_dt$PROD_MONTH, "Date")) {
+        prod_dt[, PROD_MONTH := as.Date(PROD_MONTH)]
+      }
+
+      vol_cols <- c("OIL_BBL", "COND_BBL", "GAS_MCF")
+      for (vc in vol_cols) {
+        if (!vc %in% names(prod_dt)) prod_dt[, (vc) := 0]
+        prod_dt[is.na(get(vc)), (vc) := 0]
+      }
+
+      prod_dt[, TOTAL_VOL_BOE := (OIL_BBL + COND_BBL) + (GAS_MCF / 6.0)]
+
+      last_prod_by_well <- prod_dt[TOTAL_VOL_BOE > 0,
+        .(LAST_PROD_MONTH = max(PROD_MONTH, na.rm = TRUE)),
+        by = GSL_UWI
+      ]
+    } else {
+      last_prod_by_well <- data.table::data.table(
+        GSL_UWI = character(),
+        LAST_PROD_MONTH = as.Date(character())
+      )
     }
-    req(inherits(base_sf, "sf"), nrow(base_sf) > 0)
 
-    wx_raw <- data.table::as.data.table(sf::st_drop_geometry(base_sf))
-    if ("GSL_UWI_STD" %in% names(wx_raw) && !"GSL_UWI_Std" %in% names(wx_raw)) data.table::setnames(wx_raw, "GSL_UWI_STD", "GSL_UWI_Std")
-    if ("GSL_UWI" %in% names(wx_raw) && !"GSL_UWI_Std" %in% names(wx_raw)) wx_raw[, GSL_UWI_Std := standardize_uwi(GSL_UWI)]
-    if (!"GSL_UWI_Std" %in% names(wx_raw)) wx_raw[, GSL_UWI_Std := NA_character_]
-    if (!"UWI" %in% names(wx_raw)) wx_raw[, UWI := GSL_UWI_Std]
-    if (!"ConfidentialType" %in% names(wx_raw)) wx_raw[, ConfidentialType := NA_character_]
+    last_prod_by_well[, GSL_UWI := as.character(GSL_UWI)]
 
-    wx <- wx_raw[
-      , .(
-          UWI               = UWI %||% NA_character_,
-          GSL_UWI_Std       = GSL_UWI_Std %||% NA_character_,
-          OperatorName      = OperatorName %||% NA_character_,
-          Formation         = Formation %||% NA_character_,
-          FieldName         = FieldName %||% NA_character_,
-          ProvinceState     = ProvinceState %||% NA_character_,
-          SpudDate          = as.Date(SpudDate),
-          FirstProdDate     = as.Date(FirstProdDate),
-          AbandonmentDate   = as.Date(AbandonmentDate),
-          ConfidentialType  = ConfidentialType %||% NA_character_
-        )
+    if (exists("combined_wells_dt")) {
+      wells_base <- data.table::as.data.table(combined_wells_dt)
+    } else if (exists("wells_master_dt")) {
+      wells_base <- data.table::as.data.table(wells_master_dt)
+    } else {
+      wells_base <- data.table::as.data.table(sf::st_drop_geometry(wells_sf_global))
+    }
+
+    needed_cols <- c("GSL_UWI", "UWI", "OperatorName", "ProvinceState",
+                     "SpudDate", "FirstProdDate", "AbandonmentDate",
+                     "CurrentStatus")
+    for (nc in needed_cols) {
+      if (!nc %in% names(wells_base)) wells_base[, (nc) := NA]
+    }
+
+    if ("GSL_UWI" %in% names(wells_base)) wells_base[, GSL_UWI := as.character(GSL_UWI)]
+    if ("UWI" %in% names(wells_base)) wells_base[, UWI := as.character(UWI)]
+    wells_base[, `:=`(
+      SpudDate = as.Date(SpudDate),
+      FirstProdDate = as.Date(FirstProdDate),
+      AbandonmentDate = as.Date(AbandonmentDate)
+    )]
+
+    shutin_candidates <- merge(
+      wells_base,
+      last_prod_by_well,
+      by = "GSL_UWI",
+      all.x = TRUE,
+      sort = FALSE
+    )
+
+    shutin_flagged <- shutin_candidates[
+      !is.na(FirstProdDate) & as.Date(FirstProdDate) <= snapshot_date &
+      (is.na(AbandonmentDate) | as.Date(AbandonmentDate) > snapshot_date) &
+      (is.na(LAST_PROD_MONTH) | as.Date(LAST_PROD_MONTH) < cutoff_date)
     ]
 
-    if (!grp_col %in% names(wx)) {
-      wx[, Group := "(Unknown)"]
-    } else {
-      wx[, Group := {
-        val <- get(grp_col)
-        ifelse(is.na(val) | val == "", "(Unknown)", as.character(val))
-      }]
-    }
+    shutin_summary <- shutin_flagged[
+      , .(SHUTIN_WELL_COUNT = .N),
+      by = .(OperatorName)
+    ][order(-SHUTIN_WELL_COUNT)]
 
-    uwi_vec <- unique(stats::na.omit(wx$GSL_UWI_Std))
-    if (length(uwi_vec) == 0) {
-      reactive_vals$shutin_summary <- data.table::data.table()
-      reactive_vals$shutin_detail <- data.table::data.table()
-      showNotification("No wells available with valid IDs for shut-in calculation.", type = "warning", duration = 5)
-      return()
-    }
+    output$shutin_plot <- renderPlot({
+      validate(
+        need(nrow(shutin_summary) > 0, "No shut-in wells match the current filters.")
+      )
+      ggplot(shutin_summary,
+             aes(x = reorder(OperatorName, SHUTIN_WELL_COUNT),
+                 y = SHUTIN_WELL_COUNT)) +
+        geom_col() +
+        coord_flip() +
+        labs(
+          x = "Operator",
+          y = "Shut-in well count",
+          title = paste0(
+            "Shut-in wells as of ",
+            format(snapshot_date, '%Y-%m-%d'),
+            " (no production in last ",
+            input$shutin_zero_prod_months,
+            " months)"
+          )
+        ) +
+        theme_minimal()
+    })
 
-    snapshot_month <- lubridate::floor_date(shutin_snapshot, "month")
-    month_sequence <- seq(snapshot_month %m-% lubridate::months(zero_months - 1), snapshot_month, by = "month")
-    earliest_needed <- suppressWarnings(min(wx$SpudDate, na.rm = TRUE))
-    lookback_months <- max(zero_months + 24, 60)
-    candidate_start <- snapshot_month %m-% lubridate::months(lookback_months)
-    if (!is.finite(earliest_needed)) {
-      date_start <- candidate_start
-    } else {
-      date_start <- suppressWarnings(min(earliest_needed, candidate_start, na.rm = TRUE))
-    }
-    if (!is.finite(date_start)) date_start <- candidate_start
-    if (date_start < as.Date("1900-01-01")) date_start <- as.Date("1900-01-01")
+    shutin_detail <- shutin_flagged[, .(
+      UWI,
+      GSL_UWI,
+      OperatorName,
+      ProvinceState,
+      SpudDate = as.Date(SpudDate),
+      FirstProdDate = as.Date(FirstProdDate),
+      LAST_PROD_MONTH = as.Date(LAST_PROD_MONTH),
+      AbandonmentDate = as.Date(AbandonmentDate),
+      CurrentStatus
+    )]
 
-    prod_totals <- fetch_monthly_production_totals(uwi_vec, date_start, shutin_snapshot)
-    if (!nrow(prod_totals)) {
-      reactive_vals$shutin_summary <- data.table::data.table()
-      reactive_vals$shutin_detail <- data.table::data.table()
-      showNotification("No production history available for selected wells.", type = "warning", duration = 5)
-      return()
-    }
-
-    zero_window_dt <- data.table::CJ(GSL_UWI_STD = uwi_vec, PROD_MONTH = month_sequence, unique = TRUE)
-    zero_window_dt <- merge(zero_window_dt, prod_totals[, .(GSL_UWI_STD, PROD_MONTH, TotalVolume)],
-                            by = c("GSL_UWI_STD", "PROD_MONTH"), all.x = TRUE)
-    zero_window_dt[is.na(TotalVolume), TotalVolume := 0]
-    zero_check <- zero_window_dt[, .(ZeroStreakAllZero = all(TotalVolume <= 0, na.rm = TRUE)), by = GSL_UWI_STD]
-
-    last_prod <- prod_totals[TotalVolume > 0, .(LastProdMonth = max(PROD_MONTH, na.rm = TRUE)), by = GSL_UWI_STD]
-    if (nrow(last_prod)) {
-      last_prod[, MonthsSinceLastProd := round(lubridate::time_length(lubridate::interval(LastProdMonth, shutin_snapshot), "month"), 1)]
-    }
-
-    shutin_dt <- merge(wx, zero_check, by.x = "GSL_UWI_Std", by.y = "GSL_UWI_STD", all.x = TRUE)
-    shutin_dt <- merge(shutin_dt, last_prod, by.x = "GSL_UWI_Std", by.y = "GSL_UWI_STD", all.x = TRUE)
-    shutin_dt[is.na(ZeroStreakAllZero), ZeroStreakAllZero := FALSE]
-    shutin_dt[, ConfidentialFlag := ifelse(is.na(ConfidentialType) | ConfidentialType == "", "No", "Yes")]
-    if (exclude_conf_shutin) {
-      shutin_dt <- shutin_dt[ConfidentialFlag == "No"]
-    }
-
-    shutin_dt[, HasProductionHistory := !is.na(FirstProdDate) & FirstProdDate <= shutin_snapshot]
-    shutin_dt[, NotAbandoned := is.na(AbandonmentDate) | AbandonmentDate > shutin_snapshot]
-    shutin_dt[, LastReportedProdMonth := as.Date(LastProdMonth)]
-    shutin_dt[!is.na(LastReportedProdMonth), MonthsSinceLastProd := round(lubridate::time_length(lubridate::interval(LastReportedProdMonth, shutin_snapshot), "month"), 1)]
-    shutin_dt[is.na(MonthsSinceLastProd), MonthsSinceLastProd := NA_real_]
-    shutin_dt[, ShutIn := ZeroStreakAllZero & HasProductionHistory & NotAbandoned & !is.na(LastReportedProdMonth)]
-    shutin_dt[, SnapshotDate := shutin_snapshot]
-    shutin_dt[, ZeroProdWindowMonths := zero_months]
-
-    shutin_detail <- shutin_dt[ShutIn == TRUE,
-                               .(SnapshotDate,
-                                 UWI,
-                                 GSL_UWI_Std,
-                                 Group,
-                                 OperatorName,
-                                 ProvinceState,
-                                 Formation,
-                                 FieldName,
-                                 SpudDate,
-                                 FirstProdDate,
-                                 AbandonmentDate,
-                                 LastReportedProdMonth,
-                                 MonthsSinceLastProd,
-                                 ConfidentialFlag,
-                                 ZeroProdWindowMonths,
-                                 ShutIn = TRUE)]
-
-    if (nrow(shutin_detail)) {
-      shutin_summary <- shutin_detail[, .(ShutIn_Count = .N), by = .(Group, SnapshotDate)][order(-ShutIn_Count)]
-    } else {
-      shutin_summary <- data.table::data.table(Group = character(0), SnapshotDate = as.Date(character(0)), ShutIn_Count = integer(0))
-    }
-
-    reactive_vals$shutin_detail <- shutin_detail
-    reactive_vals$shutin_summary <- shutin_summary
-  })
-
-  output$shutin_headline <- renderText({
-    dt <- reactive_vals$shutin_summary
-    if (is.null(dt) || !nrow(dt)) return("No shut-in results yet. Select filters and click Calculate.")
-    total <- dt[, .(TotalShutIn = sum(ShutIn_Count, na.rm = TRUE)), by = SnapshotDate]
-    paste0(
-      "Shut-in counts for ", nrow(total), " snapshot(s). ",
-      paste0(format(total$SnapshotDate, "%Y-%m-%d"), ": ", total$TotalShutIn, " wells", collapse = " | ")
+    output$shutin_table <- DT::renderDT(
+      shutin_detail,
+      extensions = c("Buttons"),
+      options = list(
+        pageLength = 25,
+        dom = "Bfrtip",
+        buttons = c("copy", "csv", "excel")
+      )
     )
   })
 
-  output$shutin_bar_plot <- renderPlot({
-    dt <- reactive_vals$shutin_summary
-    req(!is.null(dt), nrow(dt) > 0)
-    p <- ggplot2::ggplot(dt, ggplot2::aes(x = Group, y = ShutIn_Count, fill = as.factor(SnapshotDate))) +
-      ggplot2::geom_col(position = "dodge") +
-      ggplot2::coord_flip() +
-      ggplot2::labs(x = NULL, y = "Shut-in well count", fill = "Snapshot") +
-      ggplot2::theme_minimal(base_size = 12)
-    print(p)
-  })
-
-  output$shutin_summary_table <- DT::renderDT({
-    dt <- reactive_vals$shutin_summary
-    req(!is.null(dt), nrow(dt) > 0)
-    DT::datatable(dt[order(SnapshotDate, -ShutIn_Count)], rownames = FALSE, options = list(pageLength = 25, scrollX = TRUE))
-  })
-
-  output$shutin_detail_table <- DT::renderDT({
-    dt <- reactive_vals$shutin_detail
-    req(!is.null(dt), nrow(dt) > 0)
-    DT::datatable(dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, UWI)],
-                  rownames = FALSE,
-                  options = list(pageLength = 25, scrollX = TRUE))
-  })
-
-  output$shutin_summary_download <- downloadHandler(
-    filename = function() paste0("shutin_summary_", Sys.Date(), ".csv"),
-    content = function(file) {
-      dt <- reactive_vals$shutin_summary
-      if (is.null(dt) || !nrow(dt)) {
-        data.table::fwrite(data.table::data.table(), file)
-        return()
-      }
-      data.table::fwrite(dt[order(SnapshotDate, -ShutIn_Count)], file)
-    }
-  )
-
-  output$shutin_detail_download <- downloadHandler(
-    filename = function() paste0("shutin_detail_", Sys.Date(), ".csv"),
-    content = function(file) {
-      dt <- reactive_vals$shutin_detail
-      if (is.null(dt) || !nrow(dt)) {
-        data.table::fwrite(data.table::data.table(), file)
-        return()
-      }
-      data.table::fwrite(dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, UWI)], file)
-    }
-  )
 
   filtered_group_cumulative_data <- eventReactive(input$calculate_filtered_cumulative, {
     req(wells_sf_global, input$product_type_filter_analysis, input$filtered_group_breakout_by)
