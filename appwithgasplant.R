@@ -628,16 +628,55 @@ if (load_from_db) {
   app_data$company_layers_list <- list()
   
   if (is.null(con) || !dbIsValid(con)) { message("Attempting to (re)connect to database for data loading..."); con <- connect_to_db(); if (is.null(con) || !dbIsValid(con)) { stop("FATAL: Database connection failed. Cannot load primary data.") } }
-  
+
+  wd_join_condition <- "WD.UWI = W.UWI"
+  if (!is.null(con) && dbIsValid(con)) {
+    wd_cols_upper <- tryCatch({
+      info <- DBI::dbGetQuery(
+        con,
+        "SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE OWNER = 'CLIENT_VIEWS' AND TABLE_NAME = 'WELL_DRILLING_V11'"
+      )
+      unique(toupper(info$COLUMN_NAME))
+    }, error = function(e) {
+      sample_cols <- tryCatch({
+        sample_df <- DBI::dbGetQuery(con, "SELECT * FROM CLIENT_VIEWS.WELL_DRILLING_V11 WHERE ROWNUM <= 0")
+        if (is.data.frame(sample_df)) {
+          unique(toupper(names(sample_df)))
+        } else {
+          character(0)
+        }
+      }, error = function(e2) {
+        character(0)
+      })
+      sample_cols
+    })
+
+    if (length(wd_cols_upper)) {
+      if ("UWI" %in% wd_cols_upper) {
+        wd_join_condition <- "WD.UWI = W.UWI"
+      } else if ("GSL_UWI" %in% wd_cols_upper) {
+        wd_join_condition <- "WD.GSL_UWI = W.GSL_UWI"
+      } else if ("GSL_UWI_STD" %in% wd_cols_upper) {
+        wd_join_condition <- "WD.GSL_UWI_STD = W.GSL_UWI"
+      } else {
+        message("WARNING: CLIENT_VIEWS.WELL_DRILLING_V11 lacks UWI/GSL_UWI columns; defaulting rig release join to WD.UWI = W.UWI")
+      }
+    } else {
+      message("WARNING: Unable to inspect CLIENT_VIEWS.WELL_DRILLING_V11 columns; defaulting rig release join to WD.UWI = W.UWI")
+    }
+  }
+  message("Rig release join condition: ", wd_join_condition)
+
   sql_well_master_base <- paste0(
     "SELECT W.UWI, W.GSL_UWI, W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE, ",
     "W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE, W.GSL_FULL_LATERAL_LENGTH, ",
     "W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE, ",
-    "P.STRAT_UNIT_ID, W.SPUD_DATE, W.RIG_RELEASE_DATE, PFS.FIRST_PROD_DATE, W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, FL.FIELD_NAME ",
+    "P.STRAT_UNIT_ID, W.SPUD_DATE, WD.RIG_RELEASE_DATE AS RIG_RELEASE_DATE, PFS.FIRST_PROD_DATE, W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, FL.FIELD_NAME ",
     "FROM WELL W ",
     "LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI ",
     "LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID ",
     "LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI ",
+    "LEFT JOIN CLIENT_VIEWS.WELL_DRILLING_V11 WD ON ", wd_join_condition, " ",
     "WHERE W.SURFACE_LATITUDE IS NOT NULL AND W.SURFACE_LONGITUDE IS NOT NULL ",
     "AND (W.ABANDONMENT_DATE IS NULL OR W.ABANDONMENT_DATE > SYSDATE - (365*20))"
   )
