@@ -481,7 +481,7 @@ final_sf_column_names <- c(
   "UWI", "GSL_UWI", "SurfaceLatitude", "SurfaceLongitude",
   "BH_Latitude", "BH_Longitude", "LateralLength",
   "AbandonmentDate", "WellName", "CurrentStatus", "OperatorCode", "StratUnitID",
-  "SpudDate", "FirstProdDate", "FinalTD", "ProvinceState", "Country",
+  "SpudDate", "RigReleaseDate", "FirstProdDate", "FinalTD", "ProvinceState", "Country",
   "UWI_Std", "GSL_UWI_Std", "OperatorName", "Formation", "FieldName",
   "ConfidentialType"
 )
@@ -494,6 +494,7 @@ empty_wells_df_for_sf$LateralLength <- numeric()
 empty_wells_df_for_sf$AbandonmentDate <- as.Date(character()); empty_wells_df_for_sf$WellName <- character()
 empty_wells_df_for_sf$CurrentStatus <- character(); empty_wells_df_for_sf$OperatorCode <- character()
 empty_wells_df_for_sf$StratUnitID <- character(); empty_wells_df_for_sf$SpudDate <- as.Date(character())
+empty_wells_df_for_sf$RigReleaseDate <- as.Date(character())
 empty_wells_df_for_sf$FirstProdDate <- as.Date(character()); empty_wells_df_for_sf$FinalTD <- numeric()
 empty_wells_df_for_sf$ProvinceState <- character(); empty_wells_df_for_sf$Country <- character()
 empty_wells_df_for_sf$UWI_Std <- character(); empty_wells_df_for_sf$GSL_UWI_Std <- character()
@@ -632,7 +633,7 @@ if (load_from_db) {
     "SELECT W.UWI, W.GSL_UWI, W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE, ",
     "W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE, W.GSL_FULL_LATERAL_LENGTH, ",
     "W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE, ",
-    "P.STRAT_UNIT_ID, W.SPUD_DATE, PFS.FIRST_PROD_DATE, W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, FL.FIELD_NAME ",
+    "P.STRAT_UNIT_ID, W.SPUD_DATE, W.RIG_RELEASE_DATE, PFS.FIRST_PROD_DATE, W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, FL.FIELD_NAME ",
     "FROM WELL W ",
     "LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI ",
     "LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID ",
@@ -701,7 +702,7 @@ if (load_from_db) {
       "GSL_FULL_LATERAL_LENGTH"="LateralLength", # Updated mapping for LateralLength
       "ABANDONMENT_DATE"="AbandonmentDate", "WELL_NAME"="WellName", "CURRENT_STATUS"="CurrentStatus",
       "OPERATOR_CODE"="OperatorCode", "STRAT_UNIT_ID"="StratUnitID",
-      "SPUD_DATE"="SpudDate", "FIRST_PROD_DATE"="FirstProdDate",
+      "SPUD_DATE"="SpudDate", "RIG_RELEASE_DATE"="RigReleaseDate", "FIRST_PROD_DATE"="FirstProdDate",
       "FINAL_TD"="FinalTD", "PROVINCE_STATE"="ProvinceState", "COUNTRY"="Country",
       "UWI_Std"="UWI_Std", "GSL_UWI_Std"="GSL_UWI_Std",
       "OperatorNameDisplay"="OperatorName", "Formation"="Formation", "FieldName"="FieldName",
@@ -743,7 +744,7 @@ if (load_from_db) {
     
     if("SurfaceLatitude" %in% names(combined_wells_dt) && !is.numeric(combined_wells_dt$SurfaceLatitude)) combined_wells_dt[, SurfaceLatitude := as.numeric(SurfaceLatitude)]
     if("SurfaceLongitude" %in% names(combined_wells_dt) && !is.numeric(combined_wells_dt$SurfaceLongitude)) combined_wells_dt[, SurfaceLongitude := as.numeric(SurfaceLongitude)]
-    date_cols_to_convert_pascal <- c("SpudDate", "FirstProdDate", "AbandonmentDate")
+    date_cols_to_convert_pascal <- c("SpudDate", "RigReleaseDate", "FirstProdDate", "AbandonmentDate")
     for(dc_pascal in date_cols_to_convert_pascal){ if(dc_pascal %in% names(combined_wells_dt) && !inherits(combined_wells_dt[[dc_pascal]], "Date")){ current_col_values <- combined_wells_dt[[dc_pascal]]; if(inherits(current_col_values, "POSIXct") || inherits(current_col_values, "POSIXlt")) { combined_wells_dt[, (dc_pascal) := as.Date(current_col_values)] } else { combined_wells_dt[, (dc_pascal) := as.Date(as.character(current_col_values), origin = "1970-01-01")] } } }
     combined_wells_for_sf <- combined_wells_dt[!is.na(SurfaceLatitude) & !is.na(SurfaceLongitude)]
     if (nrow(combined_wells_for_sf) > 0) {
@@ -1066,7 +1067,7 @@ ui <- fluidPage(
 
                                 sliderInput(
                                   "duc_min_hold_days",
-                                  "Min days since spud to count as DUC",
+                                  "Min days since rig release (or spud if rig release missing) to count as DUC",
                                   min = 0,
                                   max = 180,
                                   value = 30,
@@ -1075,7 +1076,7 @@ ui <- fluidPage(
 
                                 sliderInput(
                                   "duc_max_hold_days",
-                                  "Max days allowed since spud (exclude long-term zombies)",
+                                  "Max days allowed since rig release/spud (exclude long-term zombies)",
                                   min = 30,
                                   max = 2000,
                                   value = 730,
@@ -1084,7 +1085,7 @@ ui <- fluidPage(
 
                                 sliderInput(
                                   "duc_spud_recency_months",
-                                  "Only include wells spud within last __ months (recency window)",
+                                  "Only include wells rig-released in last __ months (recency window)",
                                   min = 1,
                                   max = 60,
                                   value = 36,
@@ -1093,7 +1094,7 @@ ui <- fluidPage(
 
                                 sliderInput(
                                   "duc_max_months_cap",
-                                  "Max months between spud and first production to still call it 'DUC' (ignore wells that have been sitting longer than this many months without first production)",
+                                  "Max months between rig release and first production to still call it 'DUC' (ignore wells that have been sitting longer than this many months without first production)",
                                   min = 1,
                                   max = 120,
                                   value = 24,
@@ -1135,13 +1136,13 @@ ui <- fluidPage(
                                     tags$li(
                                       "For each snapshot date D, a well is counted as a DUC if:",
                                       tags$ul(
-                                        tags$li("The well has been spud on or before D (SpudDate ≤ D)."),
+                                        tags$li("The well reached rig release on or before D (RigReleaseDate ≤ D; falls back to SpudDate when RigReleaseDate is missing)."),
                                         tags$li("The well has NOT started first production on/before D (FirstProdDate is blank OR FirstProdDate > D)."),
                                         tags$li("The well is not abandoned as of D (AbandonmentDate is blank OR AbandonmentDate > D)."),
-                                        tags$li("The well has existed at least [Min days since spud] days by D."),
-                                        tags$li("The well has existed no more than [Max days allowed since spud] days by D (drops multi-year zombies / economic suspensions)."),
-                                        tags$li("The well was spud within the last [Recency window in months] months as of D (optional high-grading for current programs)."),
-                                        tags$li("The well has not exceeded [Max months between spud and first production] months with no first production (prevents including very old inventory)."),
+                                        tags$li("The well has existed at least [Min days since rig release/spud] days by D."),
+                                        tags$li("The well has existed no more than [Max days allowed since rig release/spud] days by D (drops multi-year zombies / economic suspensions)."),
+                                        tags$li("The well was rig-released within the last [Recency window in months] months as of D (optional high-grading for current programs)."),
+                                        tags$li("The well has not exceeded [Max months between rig release and first production] months with no first production (prevents including very old inventory)."),
                                         tags$li("If 'Exclude wells flagged Confidential' is checked, wells flagged Confidential are dropped.")
                                       )
                                     ),
@@ -1630,26 +1631,28 @@ server <- function(input, output, session) {
   ) {
     d <- as.Date(snap_date)
 
+    drill_done_date <- data.table::fcoalesce(dt$RigReleaseDate, dt$SpudDate)
+
     # Core conditions
-    drilled_before_snap <- !is.na(dt$SpudDate) & dt$SpudDate <= d
+    drilled_before_snap <- !is.na(drill_done_date) & drill_done_date <= d
     not_on_prod_yet     <- (is.na(dt$FirstProdDate) | dt$FirstProdDate > d)
     not_abandoned       <- (is.na(dt$AbandonmentDate) | dt$AbandonmentDate > d)
 
-    # Age since spud at snapshot
-    age_days <- as.numeric(d - dt$SpudDate)
+    # Age since drilling finished (rig release or spud fallback) at snapshot
+    age_days <- as.numeric(d - drill_done_date)
 
-    # 1. Minimum hold threshold (exclude wells that are too fresh)
+    # 1. Minimum hold threshold (exclude wells that are too fresh after drill finish)
     long_enough <- !is.na(age_days) & (age_days >= as.numeric(min_hold_days))
 
     # 2. Maximum hold threshold (exclude zombie wells that have sat for years)
     not_too_old <- !is.na(age_days) & (age_days <= as.numeric(max_hold_days))
 
-    # 3. Recency filter: spud must be within the last N months at snapshot
+    # 3. Recency filter: drill finish must be within the last N months at snapshot
     #    Convert months to ~30.4375 days for a rough but consistent cutoff.
     recency_days <- as.numeric(recency_months) * 30.4375
     recent_enough <- !is.na(age_days) & (age_days <= recency_days)
 
-    # 4. Maximum months between spud and first production cap
+    # 4. Maximum months between drill finish and first production cap
     cap_days <- as.numeric(max_months_cap) * 30.4375
     within_month_cap <- !is.na(age_days) & (age_days <= cap_days)
 
@@ -1702,12 +1705,13 @@ server <- function(input, output, session) {
 
     # audit columns
     out[, SnapshotDate := d]
-    out[, DaysSinceSpud := as.numeric(SnapshotDate - SpudDate)]
-    out[, MonthsSinceSpud := round(DaysSinceSpud / 30.4375, 1)]
-    out[, MinHold_OK := DaysSinceSpud >= as.numeric(min_hold_days)]
-    out[, MaxHold_OK := DaysSinceSpud <= as.numeric(max_hold_days)]
-    out[, InRecencyWindow := DaysSinceSpud <= as.numeric(recency_months) * 30.4375]
-    out[, MaxMonthsCap_OK := DaysSinceSpud <= as.numeric(max_months_cap) * 30.4375]
+    out[, DrillDoneDate := data.table::fcoalesce(RigReleaseDate, SpudDate)]
+    out[, DaysSinceDrillDone := as.numeric(SnapshotDate - DrillDoneDate)]
+    out[, MonthsSinceDrillDone := round(DaysSinceDrillDone / 30.4375, 1)]
+    out[, MinHold_OK := DaysSinceDrillDone >= as.numeric(min_hold_days)]
+    out[, MaxHold_OK := DaysSinceDrillDone <= as.numeric(max_hold_days)]
+    out[, InRecencyWindow := DaysSinceDrillDone <= as.numeric(recency_months) * 30.4375]
+    out[, MaxMonthsCap_OK := DaysSinceDrillDone <= as.numeric(max_months_cap) * 30.4375]
     out[, NotOnProd := (is.na(FirstProdDate) | FirstProdDate > SnapshotDate)]
     out[, NotAbandoned := (is.na(AbandonmentDate) | AbandonmentDate > SnapshotDate)]
     out[, ConfidentialFlag := ifelse(is.na(ConfidentialType) | ConfidentialType == "", "No", "Yes")]
@@ -1730,11 +1734,13 @@ server <- function(input, output, session) {
       Formation,
       FieldName,
       SpudDate,
+      RigReleaseDate,
       FirstProdDate,
       AbandonmentDate,
       SnapshotDate,
-      DaysSinceSpud,
-      MonthsSinceSpud,
+      DrillDoneDate,
+      DaysSinceDrillDone,
+      MonthsSinceDrillDone,
       MinHold_OK,
       MaxHold_OK,
       InRecencyWindow,
@@ -3316,6 +3322,7 @@ server <- function(input, output, session) {
     if (!"GSL_UWI_Std" %in% names(wx_raw)) wx_raw[, GSL_UWI_Std := NA_character_]
     if (!"UWI" %in% names(wx_raw)) wx_raw[, UWI := GSL_UWI_Std]
     if (!"ConfidentialType" %in% names(wx_raw)) wx_raw[, ConfidentialType := NA_character_]
+    if (!"RigReleaseDate" %in% names(wx_raw)) wx_raw[, RigReleaseDate := as.Date(NA)]
 
     wx <- wx_raw[
       , .(
@@ -3326,6 +3333,7 @@ server <- function(input, output, session) {
           FieldName         = FieldName %||% NA_character_,
           ProvinceState     = ProvinceState %||% NA_character_,
           SpudDate          = as.Date(SpudDate),
+          RigReleaseDate    = as.Date(RigReleaseDate),
           FirstProdDate     = as.Date(FirstProdDate),
           AbandonmentDate   = as.Date(AbandonmentDate),
           ConfidentialType  = ConfidentialType %||% NA_character_
