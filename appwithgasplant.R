@@ -1434,8 +1434,12 @@ ui <- fluidPage(
                                      h4(textOutput("duc_headline")),
                                      plotlyOutput("duc_bar_compare", height = "45vh"),
                                      br(),
+                                     DTOutput("duc_pivot"),
+                                     br(),
                                      downloadButton("duc_download", "Download DUC table (CSV)"),
                                      DTOutput("duc_table"),
+                                     checkboxInput("duc_show_rows", "Show row-level DUCs (paged)", value = FALSE),
+                                     DTOutput("duc_rows"),
                                      hr(),
                                      h4("DUC detail (well-level)"),
                                      div(style = "margin-bottom:8px;",
@@ -2093,6 +2097,29 @@ server <- function(input, output, session) {
     }
 
     filtered_dt <- data.table::copy(dt)
+
+    filtered_dt[, ProvinceState := toupper(trimws(as.character(ProvinceState)))]
+    filtered_dt[ProvinceState %in% c("B.C.","BC.","B C","BRITISH COLUMBIA","B.C","B C."), ProvinceState := "BC"]
+    filtered_dt[ProvinceState %in% c("ALBERTA","ALTA","AB.","AB "), ProvinceState := "AB"]
+    filtered_dt[ProvinceState %in% c("SASK","SASKATCHEWAN","SK.","SK "), ProvinceState := "SK"]
+    filtered_dt[, ProvinceState := trimws(ProvinceState)]
+
+    message("DUC DEBUG: unique ProvinceState in duc_pool AFTER normalize:")
+    print(sort(unique(filtered_dt$ProvinceState)))
+    message("DUC DEBUG: Province counts BEFORE DUC rules:")
+    print(table(filtered_dt$ProvinceState, useNA = 'ifany'))
+    message("DUC DEBUG: RigReleaseDate NA rate by Province:")
+    print(table(filtered_dt$ProvinceState, is.na(filtered_dt$RigReleaseDate), useNA = 'ifany'))
+    message("DUC DEBUG: ConfidentialType by Province:")
+    print(table(filtered_dt$ProvinceState, filtered_dt$ConfidentialType, useNA = 'ifany'))
+    message("DUC DEBUG: Sample BC-like rows BEFORE DUC rules:")
+    print(head(
+      filtered_dt[ProvinceState == "BC",
+                  .(UWI, ProvinceState, RigReleaseDate, FirstProdDate,
+                    AbandonmentDate, ConfidentialType, OperatorName,
+                    FieldName, Formation)],
+      20
+    ))
 
     if (!is.null(input$operator_filter) && length(input$operator_filter) > 0 && "OperatorName" %in% names(filtered_dt)) {
       sel <- input$operator_filter
@@ -4033,6 +4060,51 @@ server <- function(input, output, session) {
       rownames = FALSE,
       options = list(pageLength = 25, scrollX = TRUE)
     )
+  })
+
+  output$duc_pivot <- DT::renderDataTable({
+    dt <- duc_long_dt()
+    req(!is.null(dt), nrow(dt) > 0)
+    pivot_dt <- dt[, .N, by = .(SnapshotDate, ProvinceState, OperatorName)]
+    if (!nrow(pivot_dt)) {
+      return(DT::datatable(data.frame()))
+    }
+    cast_dt <- tryCatch({
+      data.table::dcast(pivot_dt, SnapshotDate + ProvinceState ~ OperatorName, value.var = "N", fill = 0L)
+    }, error = function(e) {
+      message("DUC DEBUG: pivot cast failed: ", e$message)
+      pivot_dt[, OperatorName := ifelse(is.na(OperatorName) | OperatorName == "", "(Unknown)", OperatorName)]
+      data.table::dcast(pivot_dt, SnapshotDate + ProvinceState ~ OperatorName, value.var = "N", fill = 0L)
+    })
+    DT::datatable(
+      cast_dt,
+      options = list(scrollX = TRUE, pageLength = 10),
+      rownames = FALSE
+    )
+  })
+
+  output$duc_rows <- DT::renderDataTable(DT::datatable(data.frame(), options = list(dom = "t")))
+
+  observe({
+    if (isTRUE(input$duc_show_rows)) {
+      output$duc_rows <- DT::renderDataTable({
+        dt <- duc_long_dt()
+        req(!is.null(dt), nrow(dt) > 0)
+        if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
+          dt <- dt[Group %in% input$duc_group_filter]
+        }
+        req(nrow(dt) > 0)
+        DT::datatable(
+          dt[, .(UWI, OperatorName, ProvinceState, Formation, FieldName,
+                 RigReleaseDate, FirstProdDate, AbandonmentDate, SnapshotDate)],
+          options = list(server = TRUE, deferRender = TRUE, pageLength = 50, scrollX = TRUE),
+          filter = "top",
+          rownames = FALSE
+        )
+      })
+    } else {
+      output$duc_rows <- DT::renderDataTable(DT::datatable(data.frame(), options = list(dom = "t")))
+    }
   })
 
   output$duc_download <- downloadHandler(
