@@ -280,46 +280,148 @@ chunk_vec <- function(x, n = 900L) {
   split(x, ceiling(seq_along(x) / n))
 }
 
-pull_monthly_prod_chunked <- function(con, uwis, month_start, month_end) {
-  uwis <- unique(trimws(as.character(uwis)))
-  uwis <- uwis[!is.na(uwis) & uwis != ""]
-  if (!length(uwis) || is.na(month_start) || is.na(month_end)) {
-    return(data.table::data.table())
-  }
+build_ids_cte <- function(ids, con) {
+  ids <- unique(trimws(as.character(ids)))
+  ids <- ids[!is.na(ids) & ids != ""]
+  if (!length(ids)) return(list(sql = "", params = list()))
 
-  chunks <- chunk_vec(uwis, 900L)
-  if (!length(chunks)) return(data.table::data.table())
-
-  out_list <- vector("list", length(chunks))
-  for (i in seq_along(chunks)) {
-    uwi_chunk <- chunks[[i]]
-    sql <- glue::glue_sql(
-      "SELECT p.GSL_UWI, p.PROD_MONTH, p.OIL_BBL, p.COND_BBL, p.GAS_MCF\n",
-      "FROM PDEN_MONTHLY p\n",
-      "WHERE p.GSL_UWI IN ({uwi_chunk*})\n",
-      "  AND p.PROD_MONTH BETWEEN {month_start_val} AND {month_end_val}",
-      uwi_chunk = uwi_chunk,
-      month_start_val = month_start,
-      month_end_val = month_end,
-      .con = con
+  placeholders <- sprintf(":u%d", seq_along(ids))
+  cte_body <- paste0(
+    paste(
+      sprintf("SELECT %s AS u FROM dual", placeholders),
+      collapse = "\nUNION ALL\n"
     )
-    chunk_dt <- tryCatch(
-      data.table::as.data.table(DBI::dbGetQuery(con, sql)),
-      error = function(e) {
-        first_id <- if (length(uwi_chunk)) uwi_chunk[1] else NA_character_
-        last_id <- if (length(uwi_chunk)) uwi_chunk[length(uwi_chunk)] else NA_character_
-        msg <- paste0(
-          "SHUTIN DEBUG: production chunk failed (chunk size = ", length(uwi_chunk),
-          ", first ID=", first_id, ", last ID=", last_id, "): ", e$message
-        )
-        message(msg)
-        stop(msg)
+  )
+  list(sql = paste0("WITH ids(u) AS (\n", cte_body, "\n)"), params = stats::setNames(as.list(ids), substr(placeholders, 2, nchar(placeholders))))
+}
+
+fetch_pden_chunk <- function(con, gsl_ids, year_from, year_to) {
+  gsl_ids <- unique(trimws(as.character(gsl_ids)))
+  gsl_ids <- gsl_ids[!is.na(gsl_ids) & gsl_ids != ""]
+  if (!length(gsl_ids)) return(data.table::data.table())
+
+  cte_info <- build_ids_cte(gsl_ids, con)
+  if (!nzchar(cte_info$sql)) return(data.table::data.table())
+
+  sql <- glue::glue_sql(
+    "{DBI::SQL(cte_info$sql)}\n",
+    "SELECT p.GSL_UWI, p.YEAR, p.PRODUCT_TYPE,\n",
+    "       p.JAN_VOLUME, p.FEB_VOLUME, p.MAR_VOLUME, p.APR_VOLUME, p.MAY_VOLUME, p.JUN_VOLUME,\n",
+    "       p.JUL_VOLUME, p.AUG_VOLUME, p.SEP_VOLUME, p.OCT_VOLUME, p.NOV_VOLUME, p.DEC_VOLUME\n",
+    "  FROM PDEN_VOL_BY_MONTH p\n",
+    "  JOIN ids ON ids.u = p.GSL_UWI\n",
+    " WHERE p.YEAR BETWEEN {year_from} AND {year_to}\n",
+    "   AND p.PRODUCT_TYPE IN ('OIL','CND','GAS')\n",
+    .con = con
+  )
+
+  tryCatch({
+    DBI::dbGetQuery(con, sql, params = cte_info$params) |> data.table::as.data.table()
+  }, error = function(e) {
+    message("SHUTIN DEBUG: fetch_pden_chunk error: ", e$message)
+    stop(e)
+  })
+}
+
+batch_fetch_pden <- function(con, ids, year_from, year_to,
+                             start_chunk = 200L, min_chunk = 25L, retry = 1L) {
+  ids <- unique(trimws(as.character(ids)))
+  ids <- ids[!is.na(ids) & ids != ""]
+  if (!length(ids)) return(list(data = data.table::data.table(), partial = FALSE))
+
+  n <- length(ids)
+  chunk <- start_chunk
+  i <- 1L
+  out <- list()
+  partial <- FALSE
+
+  while (i <= n) {
+    j <- min(i + chunk - 1L, n)
+    ids_slice <- ids[i:j]
+    message(sprintf(
+      "SHUTIN DEBUG: try chunk i=%d..%d size=%d first=%s last=%s",
+      i, j, length(ids_slice), ids_slice[1], ids_slice[length(ids_slice)]
+    ))
+    ok <- TRUE
+    res <- NULL
+    tryCatch({
+      res <- fetch_pden_chunk(con, ids_slice, year_from, year_to)
+    }, error = function(e) {
+      ok <<- FALSE
+      message(sprintf("SHUTIN DEBUG: chunk error: %s", conditionMessage(e)))
+    })
+
+    if (ok) {
+      out[[length(out) + 1L]] <- res
+      i <- j + 1L
+      if (chunk < 250L) chunk <- chunk + 25L
+    } else {
+      if (chunk > min_chunk) {
+        chunk <- max(min_chunk, chunk %/% 2L)
+        next
       }
-    )
-    out_list[[i]] <- chunk_dt
+      if (retry > 0L) {
+        retry <- retry - 1L
+        next
+      }
+      message("SHUTIN DEBUG: dropping failed slice and continuing")
+      partial <- TRUE
+      i <- j + 1L
+    }
   }
 
-  data.table::rbindlist(out_list, use.names = TRUE, fill = TRUE)
+  data_tbl <- if (length(out)) data.table::rbindlist(out, use.names = TRUE, fill = TRUE) else data.table::data.table()
+  list(data = data_tbl, partial = partial)
+}
+
+reshape_pden_monthlies <- function(pden_dt) {
+  if (is.null(pden_dt) || !nrow(pden_dt)) return(data.table::data.table())
+
+  month_cols <- c(
+    "JAN_VOLUME", "FEB_VOLUME", "MAR_VOLUME", "APR_VOLUME", "MAY_VOLUME", "JUN_VOLUME",
+    "JUL_VOLUME", "AUG_VOLUME", "SEP_VOLUME", "OCT_VOLUME", "NOV_VOLUME", "DEC_VOLUME"
+  )
+
+  missing_cols <- setdiff(month_cols, names(pden_dt))
+  for (col in missing_cols) pden_dt[, (col) := 0]
+
+  long_dt <- data.table::melt(
+    pden_dt,
+    id.vars = c("GSL_UWI", "YEAR", "PRODUCT_TYPE"),
+    measure.vars = month_cols,
+    variable.name = "MONTH_NAME",
+    value.name = "VOLUME"
+  )
+
+  month_map <- setNames(1:12, month_cols)
+  long_dt[, MONTH_NUM := month_map[MONTH_NAME]]
+  long_dt[, PROD_DATE := as.Date(sprintf("%04d-%02d-01", YEAR, MONTH_NUM))]
+  long_dt[, PRODUCT_TYPE := toupper(as.character(PRODUCT_TYPE))]
+  long_dt[is.na(VOLUME), VOLUME := 0]
+  long_dt[, VOLUME := as.numeric(VOLUME)]
+  long_dt[is.na(PROD_DATE), PROD_DATE := as.Date(NA)]
+  long_dt <- long_dt[!is.na(PROD_DATE)]
+
+  long_dt[, .(
+    OilBBL = sum(ifelse(PRODUCT_TYPE == "OIL", VOLUME, 0), na.rm = TRUE),
+    CndBBL = sum(ifelse(PRODUCT_TYPE == "CND", VOLUME, 0), na.rm = TRUE),
+    GasMCF = sum(ifelse(PRODUCT_TYPE == "GAS", VOLUME, 0), na.rm = TRUE)
+  ), by = .(GSL_UWI, PROD_DATE)]
+}
+
+infer_first_prod_date <- function(monthly_dt, threshold_boe = 3, mcf_per_boe = MCF_PER_BOE) {
+  if (is.null(monthly_dt) || !nrow(monthly_dt)) {
+    return(data.table::data.table(GSL_UWI = character(), FirstProdDateInferred = as.Date(character())))
+  }
+
+  dt <- data.table::copy(monthly_dt)
+  dt[, TotalBOE := (OilBBL + CndBBL) + (GasMCF / mcf_per_boe)]
+  dt <- dt[is.finite(TotalBOE)]
+  dt <- dt[TotalBOE > threshold_boe]
+  if (!nrow(dt)) {
+    return(data.table::data.table(GSL_UWI = character(), FirstProdDateInferred = as.Date(character())))
+  }
+  dt[, .(FirstProdDateInferred = min(PROD_DATE, na.rm = TRUE)), by = GSL_UWI]
 }
 
 # --- 1. Define File Paths and Constants ---
@@ -1150,6 +1252,25 @@ ui <- fluidPage(
                              column(6, plotlyOutput("gor_trend_by_month_plot", height = "45vh")),
                              column(6, plotlyOutput("gas_weighting_by_vintage_plot", height = "45vh"))
                            ),
+                           fluidRow(
+                             column(4,
+                                    checkboxInput(
+                                      "gor_exclude_outliers",
+                                      "Exclude GOR outliers (apply quantile cap)",
+                                      value = TRUE
+                                    )
+                             ),
+                             column(4,
+                                    numericInput(
+                                      "gor_quantile_cap",
+                                      "GOR quantile cap",
+                                      value = 0.99,
+                                      min = 0.5,
+                                      max = 1,
+                                      step = 0.01
+                                    )
+                             )
+                           ),
                            hr(),
                            downloadButton("download_gor_timeseries_csv", "Download GOR Timeseries (CSV)"),
                            DT::dataTableOutput("gor_timeseries_table")
@@ -1352,6 +1473,15 @@ ui <- fluidPage(
                           max = 120,
                           step = 1
                         ),
+                        numericInput(
+                          "shutin_residual_boe_threshold",
+                          "Treat months with ≤ this many BOE as zero:",
+                          value = 3,
+                          min = 0,
+                          max = 50,
+                          step = 0.5
+                        ),
+                        uiOutput("shutin_residual_hint"),
                         actionButton(
                           "calculate_shutin",
                           "Calculate shut-in wells",
@@ -1433,7 +1563,8 @@ server <- function(input, output, session) {
     shutin_detail = data.table::data.table(),
     shutin_snapshot = as.Date(NA),
     shutin_no_prod_months = NA_real_,
-    shutin_recent_production_window = NA_real_
+    shutin_recent_production_window = NA_real_,
+    shutin_residual_threshold = NA_real_
   )
 
   # --- PATCH 1A: safe boolean for "Oil + Condensate" toggle
@@ -3435,8 +3566,20 @@ server <- function(input, output, session) {
     if (!"LiquidsBBL" %in% names(ts_dt)) {
       ts_dt[, LiquidsBBL := OilBBL + CndBBL]
     }
+    ts_dt[, LiquidsForGOR := suppressWarnings(as.numeric(LiquidsBBL))]
+    if (isTRUE(input$gor_exclude_outliers)) {
+      cap_prob <- suppressWarnings(as.numeric(input$gor_quantile_cap))
+      if (!is.finite(cap_prob) || cap_prob <= 0 || cap_prob > 1) cap_prob <- 0.99
+      ts_dt <- ts_dt[is.na(LiquidsForGOR) | LiquidsForGOR >= 0.5]
+      finite_gor <- ts_dt[is.finite(GOR_MCF_PER_BBL) & GOR_MCF_PER_BBL >= 0, GOR_MCF_PER_BBL]
+      if (length(finite_gor)) {
+        cap_val <- stats::quantile(finite_gor, probs = cap_prob, na.rm = TRUE, names = FALSE)
+        ts_dt[is.finite(GOR_MCF_PER_BBL) & GOR_MCF_PER_BBL > cap_val, GOR_MCF_PER_BBL := cap_val]
+      }
+    }
     ts_dt[, CalendarMonth := lubridate::floor_date(PROD_DATE, "month")]
     ts_dt[, GasWeighting := if ("GasWeighting" %in% names(ts_dt)) GasWeighting else NA_real_]
+    ts_dt[, LiquidsForGOR := NULL]
     ts_dt[, GasWeightPct := ifelse(is.finite(GasWeighting), GasWeighting * 100, NA_real_)]
 
     ts_dt
@@ -3700,6 +3843,12 @@ server <- function(input, output, session) {
         ifelse(is.na(val) | val == "", "(Unknown)", as.character(val))
       }]
 
+      working[, RuleMatch := data.table::fifelse(
+        is.na(FirstProdDate),
+        "NoFirstProd + WithinReleaseWindows",
+        "FirstProdAfterSnapshot"
+      )]
+
       working[, .(
         UWI,
         GSL_UWI,
@@ -3721,7 +3870,8 @@ server <- function(input, output, session) {
         DaysSinceRelease,
         RecencyMonths,
         GapMonths,
-        Group
+        Group,
+        RuleMatch
       )]
     })
 
@@ -3748,7 +3898,8 @@ server <- function(input, output, session) {
         DaysSinceRelease = numeric(),
         RecencyMonths = numeric(),
         GapMonths = numeric(),
-        Group = character()
+        Group = character(),
+        RuleMatch = character()
       )
     } else {
       message("DUC DEBUG: Final grouped DUC counts by ProvinceState at each snapshot:")
@@ -3757,6 +3908,8 @@ server <- function(input, output, session) {
           , .(DUC_Count = .N), by = .(ProvinceState, SnapshotDate)
         ][order(SnapshotDate, ProvinceState)]
       )
+      message("DUC DEBUG: LicensedSubstance distribution AFTER DUC rules:")
+      print(table(detail_dt$LicensedSubstance, useNA = 'ifany'))
     }
 
     detail_dt
@@ -3940,18 +4093,27 @@ server <- function(input, output, session) {
     }
   )
 
+  output$shutin_residual_hint <- renderUI({
+    thr <- suppressWarnings(as.numeric(input$shutin_residual_boe_threshold))
+    if (!is.finite(thr)) thr <- 3
+    shiny::helpText(sprintf("Months with ≤ %.1f BOE are treated as zero for shut-in detection.", thr))
+  })
+
   observeEvent(input$calculate_shutin, {
     req(input$shutin_snapshot_date)
     req(input$shutin_no_prod_months)
     req(input$shutin_recent_production_window)
+    req(input$shutin_residual_boe_threshold)
 
     snapshot_date <- as.Date(input$shutin_snapshot_date)
-    no_prod_months <- as.integer(input$shutin_no_prod_months)
-    recent_window_mo <- as.integer(input$shutin_recent_production_window)
+    no_prod_months <- max(1L, as.integer(input$shutin_no_prod_months))
+    recent_window_mo <- max(0L, as.integer(input$shutin_recent_production_window))
+    residual_threshold <- max(0, as.numeric(input$shutin_residual_boe_threshold))
 
     reactive_vals$shutin_snapshot <- snapshot_date
     reactive_vals$shutin_no_prod_months <- no_prod_months
     reactive_vals$shutin_recent_production_window <- recent_window_mo
+    reactive_vals$shutin_residual_threshold <- residual_threshold
 
     base_sf <- reactive_vals$wells_filtered_base
     if (is.null(base_sf) || nrow(base_sf) == 0) {
@@ -3970,21 +4132,18 @@ server <- function(input, output, session) {
     }
 
     needed_cols <- c("GSL_UWI", "UWI", "OperatorName", "ProvinceState",
-                     "SpudDate", "FirstProdDate", "AbandonmentDate", "CurrentStatus",
-                     "Formation", "FieldName", "RigReleaseDate")
+                     "SpudDate", "RigReleaseDate", "FirstProdDate", "AbandonmentDate",
+                     "CurrentStatus", "Formation", "FieldName")
     for (nc in needed_cols) {
       if (!nc %in% names(wells_base)) wells_base[, (nc) := NA]
     }
 
-    date_cols <- intersect(c("SpudDate", "FirstProdDate", "AbandonmentDate", "RigReleaseDate"), names(wells_base))
+    date_cols <- intersect(c("SpudDate", "RigReleaseDate", "FirstProdDate", "AbandonmentDate"), names(wells_base))
     for (dc in date_cols) {
       wells_base[, (dc) := as.Date(get(dc))]
     }
 
-    if (!"GSL_UWI" %in% names(wells_base)) {
-      wells_base[, GSL_UWI := NA_character_]
-    }
-    wells_base[, GSL_UWI := trimws(as.character(GSL_UWI))]
+    wells_base[, GSL_UWI := trimws(as.character(ifelse("GSL_UWI" %in% names(wells_base), GSL_UWI, NA_character_)))]
 
     shutin_pool <- data.table::copy(wells_base)
     shutin_pool[, ProvinceState := toupper(trimws(as.character(ProvinceState)))]
@@ -4008,42 +4167,35 @@ server <- function(input, output, session) {
       return(invisible(NULL))
     }
 
-    build_month_window <- function(snap_date, n_months) {
-      if (is.na(snap_date) || n_months <= 0) return(as.Date(character()))
-      snap_month_start <- lubridate::floor_date(snap_date, unit = "month")
-      last_full_month_start <- lubridate::floor_date(snap_month_start - lubridate::days(1), unit = "month")
-      rev(sapply(seq_len(n_months) - 1, function(i) {
-        lubridate::floor_date(last_full_month_start - lubridate::days(30 * i), unit = "month")
-      }))
+    last_full_month <- lubridate::floor_date(snapshot_date, unit = "month") - lubridate::days(1)
+    month_end <- lubridate::floor_date(last_full_month, unit = "month")
+    silent_months <- if (no_prod_months > 0) {
+      rev(lubridate::floor_date(month_end - lubridate::months(seq_len(no_prod_months) - 1L), unit = "month"))
+    } else {
+      as.Date(character())
+    }
+    recent_months <- if (recent_window_mo > 0) {
+      rev(lubridate::floor_date(month_end - lubridate::months(seq_len(recent_window_mo) - 1L), unit = "month"))
+    } else {
+      as.Date(character())
+    }
+    window_months_all <- sort(unique(c(silent_months, recent_months)))
+    if (!length(window_months_all)) {
+      window_months_all <- month_end
     }
 
-    silent_window_months <- build_month_window(snapshot_date, no_prod_months)
-    recent_window_months <- build_month_window(snapshot_date, recent_window_mo)
-    all_needed_months <- sort(unique(c(silent_window_months, recent_window_months)))
-
-    if (!length(all_needed_months)) {
-      reactive_vals$shutin_summary <- data.table::data.table()
-      reactive_vals$shutin_detail <- data.table::data.table()
-      showNotification("Unable to derive production windows for shut-in analysis.", type = "warning", duration = 5)
-      return(invisible(NULL))
-    }
-
-    month_start <- min(all_needed_months)
-    month_end <- max(all_needed_months)
-    no_prod_start <- if (length(silent_window_months)) min(silent_window_months) else as.Date(NA)
-
+    month_start <- min(window_months_all)
     message(
       "SHUTIN SNAPSHOT: ", snapshot_date,
       " | nCandidates=", nrow(shutin_pool),
       " | month_start=", as.character(month_start),
-      " | no_prod_start=", as.character(no_prod_start),
-      " | month_end=", as.character(month_end)
+      " | no_prod_start=", ifelse(length(silent_months), as.character(min(silent_months)), NA_character_),
+      " | month_end=", as.character(max(window_months_all))
     )
 
     if (is.null(con) || !DBI::dbIsValid(con)) {
       con <<- connect_to_db()
     }
-
     if (is.null(con) || !DBI::dbIsValid(con)) {
       reactive_vals$shutin_summary <- data.table::data.table()
       reactive_vals$shutin_detail <- data.table::data.table()
@@ -4051,130 +4203,94 @@ server <- function(input, output, session) {
       return(invisible(NULL))
     }
 
-    prod_error <- FALSE
-    prod_dt <- tryCatch(
-      pull_monthly_prod_chunked(con, valid_ids, month_start, month_end),
-      error = function(e) {
-        prod_error <<- TRUE
-        message("SHUTIN DEBUG: production query failed: ", e$message)
-        data.table::data.table()
-      }
-    )
+    year_from <- max(1900L, min(lubridate::year(window_months_all)) - 1L)
+    year_to <- lubridate::year(snapshot_date)
 
-    if (isTRUE(prod_error)) {
+    fetch_res <- batch_fetch_pden(con, valid_ids, year_from, year_to)
+    prod_dt <- fetch_res$data
+    if (isTRUE(fetch_res$partial)) {
+      showNotification("Production data incomplete for some wells; shut-in results may be conservative.", type = "warning", duration = 6)
+    }
+
+    message("SHUTIN DEBUG: production rows fetched=", nrow(prod_dt))
+
+    monthly_totals <- reshape_pden_monthlies(prod_dt)
+    if (!nrow(monthly_totals)) {
       reactive_vals$shutin_summary <- data.table::data.table()
       reactive_vals$shutin_detail <- data.table::data.table()
-      showNotification("Production query failed, cannot calculate shut-in wells right now.", type = "error", duration = 6)
+      showNotification("No shut-in wells found (no production history available for the selected set).", type = "warning", duration = 5)
       return(invisible(NULL))
     }
 
-    if (exists("prod_dt")) {
-      message("SHUTIN PROD PULLED: nRows=", nrow(prod_dt), " nWells=", length(unique(prod_dt$GSL_UWI)))
-    }
+    monthly_totals <- monthly_totals[PROD_DATE <= month_end]
+    monthly_totals[, TotalBOE := (OilBBL + CndBBL) + (GasMCF / MCF_PER_BOE)]
+    monthly_totals[is.na(TotalBOE), TotalBOE := 0]
 
-    if (nrow(prod_dt) > 0) {
-      if (!inherits(prod_dt$PROD_MONTH, "Date")) {
-        prod_dt[, PROD_MONTH := as.Date(PROD_MONTH)]
-      }
-      prod_dt[, GSL_UWI := trimws(as.character(GSL_UWI))]
-      prod_dt <- prod_dt[GSL_UWI %in% valid_ids]
+    first_inferred <- infer_first_prod_date(monthly_totals, residual_threshold, MCF_PER_BOE)
+    last_prod_month <- monthly_totals[TotalBOE > residual_threshold & PROD_DATE <= month_end,
+                                      .(LastProdMonth = max(PROD_DATE)), by = GSL_UWI]
 
-      vol_cols <- c("OIL_BBL", "COND_BBL", "GAS_MCF")
-      for (vc in vol_cols) {
-        if (!vc %in% names(prod_dt)) prod_dt[, (vc) := 0]
-        prod_dt[is.na(get(vc)), (vc) := 0]
-      }
-
-      prod_dt[, TOTAL_VOL_BOE := (OIL_BBL + COND_BBL) + (GAS_MCF / 6.0)]
-    } else {
-      prod_dt <- data.table::data.table(
-        GSL_UWI = character(),
-        PROD_MONTH = as.Date(character()),
-        TOTAL_VOL_BOE = numeric()
+    if (length(window_months_all)) {
+      window_grid <- data.table::CJ(GSL_UWI = unique(valid_ids), PROD_DATE = window_months_all, unique = TRUE)
+      window_grid <- merge(
+        window_grid,
+        monthly_totals[, .(GSL_UWI, PROD_DATE, TotalBOE)],
+        by = c("GSL_UWI", "PROD_DATE"),
+        all.x = TRUE,
+        sort = FALSE
       )
+      window_grid[is.na(TotalBOE), TotalBOE := 0]
+    } else {
+      window_grid <- data.table::data.table(GSL_UWI = unique(valid_ids), PROD_DATE = as.Date(character()), TotalBOE = numeric())
     }
 
-    sum_over_window <- function(month_vec, wells_scope) {
-      if (!length(wells_scope)) {
-        return(data.table::data.table(GSL_UWI = character(), WINDOW_VOL_BOE = numeric()))
-      }
-      if (!length(month_vec)) {
-        return(data.table::data.table(GSL_UWI = wells_scope, WINDOW_VOL_BOE = rep(0, length(wells_scope))))
-      }
-      combo <- data.table::CJ(GSL_UWI = wells_scope, PROD_MONTH = month_vec, unique = TRUE)
-      if (nrow(prod_dt)) {
-        combo <- merge(
-          combo,
-          prod_dt[, .(GSL_UWI, PROD_MONTH, TOTAL_VOL_BOE)],
-          by = c("GSL_UWI", "PROD_MONTH"),
-          all.x = TRUE,
-          sort = FALSE
-        )
-      } else {
-        combo[, TOTAL_VOL_BOE := 0]
-      }
-      combo[is.na(TOTAL_VOL_BOE), TOTAL_VOL_BOE := 0]
-      combo[, .(WINDOW_VOL_BOE = sum(TOTAL_VOL_BOE, na.rm = TRUE)), by = GSL_UWI]
+    if (recent_window_mo > 0) {
+      recent_flag <- window_grid[PROD_DATE %in% recent_months,
+                                 .(had_recent_prod = any(TotalBOE > residual_threshold, na.rm = TRUE)),
+                                 by = GSL_UWI]
+    } else {
+      recent_flag <- data.table::data.table(GSL_UWI = unique(valid_ids), had_recent_prod = TRUE)
     }
 
-    silent_sum_dt <- sum_over_window(silent_window_months, valid_ids)
-    data.table::setnames(silent_sum_dt, "WINDOW_VOL_BOE", "SILENT_VOL_BOE")
-
-    recent_sum_dt <- sum_over_window(recent_window_months, valid_ids)
-    data.table::setnames(recent_sum_dt, "WINDOW_VOL_BOE", "RECENT_VOL_BOE")
-
-    window_stats <- merge(
-      recent_sum_dt,
-      silent_sum_dt,
-      by = "GSL_UWI",
-      all = TRUE
-    )
-    window_stats[is.na(RECENT_VOL_BOE), RECENT_VOL_BOE := 0]
-    window_stats[is.na(SILENT_VOL_BOE), SILENT_VOL_BOE := 0]
-
-    last_prod_by_well <- data.table::data.table(GSL_UWI = character(), LAST_PROD_MONTH = as.Date(character()))
-    if (nrow(prod_dt)) {
-      last_prod_by_well <- prod_dt[TOTAL_VOL_BOE > 0,
-        .(LAST_PROD_MONTH = max(PROD_MONTH, na.rm = TRUE)),
-        by = GSL_UWI
-      ]
+    silent_flag <- window_grid[PROD_DATE %in% silent_months,
+                               .(had_silent_prod = any(TotalBOE > residual_threshold, na.rm = TRUE)),
+                               by = GSL_UWI]
+    if (!nrow(silent_flag)) {
+      silent_flag <- data.table::data.table(GSL_UWI = unique(valid_ids), had_silent_prod = FALSE)
     }
 
-    shutin_candidates <- merge(
-      shutin_pool,
-      window_stats,
-      by = "GSL_UWI",
-      all.x = TRUE,
-      sort = FALSE
-    )
-    shutin_candidates <- merge(
-      shutin_candidates,
-      last_prod_by_well,
-      by = "GSL_UWI",
-      all.x = TRUE,
-      sort = FALSE
-    )
+    shutin <- merge(shutin_pool, first_inferred, by = "GSL_UWI", all.x = TRUE)
+    shutin <- merge(shutin, last_prod_month, by = "GSL_UWI", all.x = TRUE)
+    shutin <- merge(shutin, recent_flag, by = "GSL_UWI", all.x = TRUE)
+    shutin <- merge(shutin, silent_flag, by = "GSL_UWI", all.x = TRUE)
 
-    shutin_candidates[is.na(RECENT_VOL_BOE), RECENT_VOL_BOE := 0]
-    shutin_candidates[is.na(SILENT_VOL_BOE), SILENT_VOL_BOE := 0]
-    shutin_candidates[, ProvinceState := toupper(trimws(as.character(ProvinceState)))]
-    shutin_candidates[ProvinceState %in% c("B.C.", "BC.", "B C", "BRITISH COLUMBIA", "B.C", "B C."), ProvinceState := "BC"]
-    shutin_candidates[ProvinceState %in% c("ALBERTA", "ALTA", "AB.", "AB "), ProvinceState := "AB"]
-    shutin_candidates[ProvinceState %in% c("SASK", "SASKATCHEWAN", "SK.", "SK "), ProvinceState := "SK"]
-    shutin_candidates[, ProvinceState := trimws(ProvinceState)]
-    shutin_candidates[, LAST_PROD_MONTH := as.Date(LAST_PROD_MONTH)]
-    shutin_candidates[, MonthsSinceLastProd := ifelse(
-      is.na(LAST_PROD_MONTH),
-      NA_real_,
-      as.numeric(difftime(snapshot_date, LAST_PROD_MONTH, units = "days")) / 30.4375
+    shutin[is.na(had_recent_prod), had_recent_prod := (recent_window_mo == 0)]
+    shutin[is.na(had_silent_prod), had_silent_prod := FALSE]
+
+    shutin[, FirstProdDate := as.Date(FirstProdDate)]
+    shutin[, AbandonmentDate := as.Date(AbandonmentDate)]
+    shutin[, FirstProdDateInferred := as.Date(FirstProdDateInferred)]
+    shutin[, LastProdMonth := as.Date(LastProdMonth)]
+    shutin[, MonthsSinceLastProd := ifelse(
+      !is.na(LastProdMonth),
+      round(as.numeric(snapshot_date - LastProdMonth) / 30.4375, 1),
+      NA_real_
     )]
 
-    shutin_flagged <- shutin_candidates[
-      ((recent_window_mo == 0) | (RECENT_VOL_BOE > 0)) &
-      (SILENT_VOL_BOE == 0) &
-      (is.na(AbandonmentDate) | as.Date(AbandonmentDate) > snapshot_date) &
-      !is.na(FirstProdDate) & as.Date(FirstProdDate) <= snapshot_date
+    shutin[, HasProductionHistory := (
+      (!is.na(FirstProdDate) & FirstProdDate <= snapshot_date) |
+        (!is.na(FirstProdDateInferred) & FirstProdDateInferred <= snapshot_date)
+    )]
+
+    shutin_flagged <- shutin[
+      HasProductionHistory &
+        (is.na(AbandonmentDate) | AbandonmentDate > snapshot_date) &
+        had_recent_prod &
+        !had_silent_prod
     ]
+
+    message("SHUTIN DEBUG: counts by ProvinceState after rules:")
+    print(table(shutin_flagged$ProvinceState, useNA = 'ifany'))
 
     if (!nrow(shutin_flagged)) {
       reactive_vals$shutin_summary <- data.table::data.table()
@@ -4201,15 +4317,14 @@ server <- function(input, output, session) {
       RigReleaseDate = as.Date(RigReleaseDate),
       SpudDate = as.Date(SpudDate),
       FirstProdDate = as.Date(FirstProdDate),
-      LAST_PROD_MONTH,
-      MonthsSinceLastProd = round(MonthsSinceLastProd, 1),
-      RECENT_VOL_BOE,
-      SILENT_VOL_BOE,
-      AbandonmentDate = as.Date(AbandonmentDate),
-      CurrentStatus,
+      FirstProdDateInferred = as.Date(FirstProdDateInferred),
+      LastProdMonth = as.Date(LastProdMonth),
+      MonthsSinceLastProd,
+      ResidualThresholdBOE = residual_threshold,
       NoProductionMonthsThreshold = no_prod_months,
       RecentActivityWindowMonths = recent_window_mo,
-      ShutIn = TRUE
+      AbandonmentDate = as.Date(AbandonmentDate),
+      CurrentStatus
     )]
 
     reactive_vals$shutin_summary <- shutin_summary
@@ -4227,11 +4342,13 @@ server <- function(input, output, session) {
       duration = 4
     )
   })
+
   output$shutin_plot <- renderPlot({
     summary_dt <- reactive_vals$shutin_summary
     snapshot_date <- reactive_vals$shutin_snapshot
     no_prod_months <- reactive_vals$shutin_no_prod_months
     recent_window_mo <- reactive_vals$shutin_recent_production_window
+    residual_threshold <- reactive_vals$shutin_residual_threshold %||% 3
     req(!is.null(summary_dt), !is.na(snapshot_date), !is.na(no_prod_months), !is.na(recent_window_mo))
     validate(need(nrow(summary_dt) > 0, "No shut-in wells match the current criteria."))
 
@@ -4249,7 +4366,9 @@ server <- function(input, output, session) {
           recent_window_mo,
           " mo; zero production window = ",
           no_prod_months,
-          " mo)"
+          " mo; residual threshold = ",
+          residual_threshold,
+          " BOE)"
         )
       ) +
       theme_minimal(base_size = 12)
@@ -4260,7 +4379,7 @@ server <- function(input, output, session) {
     req(!is.null(detail_dt))
     validate(need(nrow(detail_dt) > 0, "No shut-in wells match the current criteria."))
 
-    detail_dt[order(SnapshotDate, OperatorName, ProvinceState, Formation, FieldName, RecentActivityWindowMonths, GSL_UWI)]
+    detail_dt[order(SnapshotDate, OperatorName, ProvinceState, Formation, FieldName, NoProductionMonthsThreshold, RecentActivityWindowMonths, GSL_UWI)]
   },
   options = list(pageLength = 25, scrollX = TRUE),
   rownames = FALSE)
@@ -4285,7 +4404,7 @@ server <- function(input, output, session) {
         data.table::fwrite(data.table::data.table(), file)
       } else {
         data.table::fwrite(
-          dt[order(SnapshotDate, OperatorName, ProvinceState, Formation, FieldName, RecentActivityWindowMonths, GSL_UWI)],
+          dt[order(SnapshotDate, OperatorName, ProvinceState, Formation, FieldName, NoProductionMonthsThreshold, RecentActivityWindowMonths, GSL_UWI)],
           file
         )
       }
