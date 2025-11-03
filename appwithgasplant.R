@@ -3461,6 +3461,7 @@ server <- function(input, output, session) {
 
     candidate <- duc_candidate_wells()
     if (is.null(candidate) || !nrow(candidate)) {
+      message("DUC DEBUG: candidate pool empty before normalization and DUC rules.")
       return(data.table::data.table(
         UWI = character(),
         GSL_UWI = character(),
@@ -3470,16 +3471,58 @@ server <- function(input, output, session) {
         FieldName = character(),
         RigReleaseDate = as.Date(character()),
         SpudDate = as.Date(character()),
+        DrillDoneDate = as.Date(character()),
         FirstProdDate = as.Date(character()),
         AbandonmentDate = as.Date(character()),
         ConfidentialType = character(),
         SnapshotDate = as.Date(character()),
-        DaysSinceRelease = numeric(),
-        RecencyMonths = numeric(),
-        GapMonths = numeric(),
+        DaysSinceRigRelease = numeric(),
+        MonthsSinceRigRelease = numeric(),
+        MonthsBetweenReleaseAndFirstProd = numeric(),
         Group = character()
       ))
     }
+
+    required_cols <- c(
+      "UWI", "GSL_UWI", "OperatorName", "ProvinceState", "Formation", "FieldName",
+      "RigReleaseDate", "SpudDate", "FirstProdDate", "AbandonmentDate", "ConfidentialType"
+    )
+    for (col in required_cols) {
+      if (!col %in% names(candidate)) {
+        candidate[, (col) := NA]
+      }
+    }
+
+    for (col in intersect(required_cols, c("OperatorName", "ProvinceState", "Formation", "FieldName", "ConfidentialType"))) {
+      candidate[, (col) := as.character(get(col))]
+    }
+    for (col in c("RigReleaseDate", "SpudDate", "FirstProdDate", "AbandonmentDate")) {
+      candidate[, (col) := as.Date(get(col))]
+    }
+
+    duc_pool <- data.table::copy(candidate)
+    duc_pool[, ProvinceState := toupper(trimws(ProvinceState))]
+    duc_pool[ProvinceState %in% c("B.C.", "BC.", "B C", "BRITISH COLUMBIA", "B.C", "B C."), ProvinceState := "BC"]
+    duc_pool[ProvinceState %in% c("ALBERTA", "ALTA", "AB.", "AB "), ProvinceState := "AB"]
+    duc_pool[ProvinceState %in% c("SASK", "SASKATCHEWAN", "SK.", "SK "), ProvinceState := "SK"]
+    duc_pool[, ProvinceState := trimws(ProvinceState)]
+
+    message("DUC DEBUG: unique ProvinceState in duc_pool AFTER normalize:")
+    print(sort(unique(duc_pool$ProvinceState)))
+    message("DUC DEBUG: Province counts BEFORE DUC rules:")
+    print(table(duc_pool$ProvinceState, useNA = 'ifany'))
+    message("DUC DEBUG: RigReleaseDate NA rate by Province:")
+    print(table(duc_pool$ProvinceState, is.na(duc_pool$RigReleaseDate), useNA = 'ifany'))
+    message("DUC DEBUG: ConfidentialType by Province:")
+    print(table(duc_pool$ProvinceState, duc_pool$ConfidentialType, useNA = 'ifany'))
+    message("DUC DEBUG: Sample BC-like rows BEFORE DUC rules:")
+    print(head(
+      duc_pool[ProvinceState == "BC",
+               .(UWI, ProvinceState, RigReleaseDate, FirstProdDate,
+                 AbandonmentDate, ConfidentialType, OperatorName,
+                 FieldName, Formation)],
+      20
+    ))
 
     grp_col <- input$duc_group_by
     if (is.null(grp_col) || !(grp_col %in% c("OperatorName", "Formation", "FieldName", "ProvinceState"))) {
@@ -3491,41 +3534,46 @@ server <- function(input, output, session) {
     recency_months <- as.numeric(input$duc_spud_recency_months %||% 36)
     max_months_cap <- as.numeric(input$duc_max_months_cap %||% 24)
 
-    candidate <- data.table::copy(candidate)
-    candidate[, RigReleaseDate := as.Date(RigReleaseDate)]
-    candidate[, SpudDate := as.Date(SpudDate)]
-    candidate[, FirstProdDate := as.Date(FirstProdDate)]
-    candidate[, AbandonmentDate := as.Date(AbandonmentDate)]
-
     detail_list <- lapply(snap_dates, function(d) {
-      working <- data.table::copy(candidate)
-      working <- working[!is.na(RigReleaseDate)]
-      working <- working[RigReleaseDate <= d]
+      working <- data.table::copy(duc_pool)
+      working[, DrillDoneDate := data.table::fcoalesce(RigReleaseDate, SpudDate)]
+      working[, FirstProdDate := as.Date(FirstProdDate)]
+      working[, AbandonmentDate := as.Date(AbandonmentDate)]
+      working <- working[!is.na(DrillDoneDate) & DrillDoneDate <= d]
       working <- working[is.na(FirstProdDate) | FirstProdDate > d]
       working <- working[is.na(AbandonmentDate) | AbandonmentDate > d]
       if (!nrow(working)) return(data.table::data.table())
 
-      working[, DaysSinceRelease := as.numeric(d - RigReleaseDate)]
-      working <- working[!is.na(DaysSinceRelease)]
-      working <- working[DaysSinceRelease >= as.numeric(min_hold_days) & DaysSinceRelease <= as.numeric(max_hold_days)]
+      working[, DaysSinceRigRelease := as.numeric(d - DrillDoneDate)]
+      working <- working[!is.na(DaysSinceRigRelease)]
+      working <- working[
+        DaysSinceRigRelease >= as.numeric(min_hold_days) &
+          DaysSinceRigRelease <= as.numeric(max_hold_days)
+      ]
       if (!nrow(working)) return(data.table::data.table())
 
-      working[, RecencyMonths := DaysSinceRelease / 30.4375]
-      working <- working[RecencyMonths <= as.numeric(recency_months)]
+      working[, MonthsSinceRigRelease := DaysSinceRigRelease / 30.4375]
+      working <- working[MonthsSinceRigRelease <= as.numeric(recency_months)]
       if (!nrow(working)) return(data.table::data.table())
 
-      working[, GapMonths := data.table::fifelse(
+      working[, MonthsBetweenReleaseAndFirstProd := data.table::fifelse(
         is.na(FirstProdDate),
         0,
-        pmax(0, as.numeric(FirstProdDate - RigReleaseDate)) / 30.4375
+        pmax(0, as.numeric(FirstProdDate - DrillDoneDate)) / 30.4375
       )]
-      working <- working[!is.na(GapMonths) & GapMonths <= as.numeric(max_months_cap)]
+      working <- working[
+        !is.na(MonthsBetweenReleaseAndFirstProd) &
+          MonthsBetweenReleaseAndFirstProd <= as.numeric(max_months_cap)
+      ]
       if (!nrow(working)) return(data.table::data.table())
 
       working[, SnapshotDate := d]
-      working[, DaysSinceRelease := as.numeric(DaysSinceRelease)]
-      working[, RecencyMonths := round(RecencyMonths, 1)]
-      working[, GapMonths := round(GapMonths, 1)]
+      working[, DaysSinceRigRelease := round(DaysSinceRigRelease, 0)]
+      working[, MonthsSinceRigRelease := round(MonthsSinceRigRelease, 1)]
+      working[, MonthsBetweenReleaseAndFirstProd := round(MonthsBetweenReleaseAndFirstProd, 1)]
+      working[, DaysSinceRelease := DaysSinceRigRelease]
+      working[, RecencyMonths := MonthsSinceRigRelease]
+      working[, GapMonths := MonthsBetweenReleaseAndFirstProd]
 
       working[, Group := {
         val <- get(grp_col)
@@ -3541,10 +3589,14 @@ server <- function(input, output, session) {
         FieldName,
         RigReleaseDate,
         SpudDate,
+        DrillDoneDate,
         FirstProdDate,
         AbandonmentDate,
         ConfidentialType,
         SnapshotDate,
+        DaysSinceRigRelease,
+        MonthsSinceRigRelease,
+        MonthsBetweenReleaseAndFirstProd,
         DaysSinceRelease,
         RecencyMonths,
         GapMonths,
@@ -3563,14 +3615,25 @@ server <- function(input, output, session) {
         FieldName = character(),
         RigReleaseDate = as.Date(character()),
         SpudDate = as.Date(character()),
+        DrillDoneDate = as.Date(character()),
         FirstProdDate = as.Date(character()),
         AbandonmentDate = as.Date(character()),
         ConfidentialType = character(),
         SnapshotDate = as.Date(character()),
+        DaysSinceRigRelease = numeric(),
+        MonthsSinceRigRelease = numeric(),
+        MonthsBetweenReleaseAndFirstProd = numeric(),
         DaysSinceRelease = numeric(),
         RecencyMonths = numeric(),
         GapMonths = numeric(),
         Group = character()
+      )
+    } else {
+      message("DUC DEBUG: Final grouped DUC counts by ProvinceState at each snapshot:")
+      print(
+        detail_dt[
+          , .(DUC_Count = .N), by = .(ProvinceState, SnapshotDate)
+        ][order(SnapshotDate, ProvinceState)]
       )
     }
 
@@ -3584,7 +3647,14 @@ server <- function(input, output, session) {
     }
     detail_copy <- data.table::copy(detail_dt)
     data.table::setorder(detail_copy, SnapshotDate)
-    detail_copy[, .(DUC_Count = .N), by = .(Group, SnapshotDate)][order(SnapshotDate, -DUC_Count)]
+    summary_dt <- detail_copy[, .(DUC_Count = .N), by = .(Group, SnapshotDate)][order(SnapshotDate, -DUC_Count)]
+    message("DUC DEBUG: Final grouped DUC counts by ProvinceState at each snapshot (from summary reactive):")
+    print(
+      detail_copy[
+        , .(DUC_Count = .N), by = .(ProvinceState, SnapshotDate)
+      ][order(SnapshotDate, ProvinceState)]
+    )
+    summary_dt
   })
 
   observeEvent(duc_summary_dt(), {
@@ -3708,7 +3778,7 @@ server <- function(input, output, session) {
       dt <- dt[Group %in% input$duc_group_filter]
     }
     req(nrow(dt) > 0)
-    dt <- dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, UWI)]
+    dt <- dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, FieldName, DrillDoneDate, UWI)]
     DT::datatable(
       dt,
       rownames = FALSE,
@@ -3727,7 +3797,10 @@ server <- function(input, output, session) {
       if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
         dt <- dt[Group %in% input$duc_group_filter]
       }
-      data.table::fwrite(dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, UWI)], file)
+      data.table::fwrite(
+        dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, FieldName, DrillDoneDate, UWI)],
+        file
+      )
     }
   )
 
@@ -3761,12 +3834,13 @@ server <- function(input, output, session) {
     }
 
     needed_cols <- c("GSL_UWI", "UWI", "OperatorName", "ProvinceState",
-                     "SpudDate", "FirstProdDate", "AbandonmentDate", "CurrentStatus")
+                     "SpudDate", "FirstProdDate", "AbandonmentDate", "CurrentStatus",
+                     "Formation", "FieldName", "RigReleaseDate")
     for (nc in needed_cols) {
       if (!nc %in% names(wells_base)) wells_base[, (nc) := NA]
     }
 
-    date_cols <- intersect(c("SpudDate", "FirstProdDate", "AbandonmentDate"), names(wells_base))
+    date_cols <- intersect(c("SpudDate", "FirstProdDate", "AbandonmentDate", "RigReleaseDate"), names(wells_base))
     for (dc in date_cols) {
       wells_base[, (dc) := as.Date(get(dc))]
     }
@@ -3775,7 +3849,20 @@ server <- function(input, output, session) {
       wells_base[, GSL_UWI := NA_character_]
     }
     wells_base[, GSL_UWI := trimws(as.character(GSL_UWI))]
-    valid_ids <- unique(wells_base$GSL_UWI)
+
+    shutin_pool <- data.table::copy(wells_base)
+    shutin_pool[, ProvinceState := toupper(trimws(as.character(ProvinceState)))]
+    shutin_pool[ProvinceState %in% c("B.C.", "BC.", "B C", "BRITISH COLUMBIA", "B.C", "B C."), ProvinceState := "BC"]
+    shutin_pool[ProvinceState %in% c("ALBERTA", "ALTA", "AB.", "AB "), ProvinceState := "AB"]
+    shutin_pool[ProvinceState %in% c("SASK", "SASKATCHEWAN", "SK.", "SK "), ProvinceState := "SK"]
+    shutin_pool[, ProvinceState := trimws(ProvinceState)]
+
+    message("SHUTIN DEBUG: unique ProvinceState in shut-in candidate pool:")
+    print(sort(unique(shutin_pool$ProvinceState)))
+    message("SHUTIN DEBUG: counts by ProvinceState after filters:")
+    print(table(shutin_pool$ProvinceState, useNA = 'ifany'))
+
+    valid_ids <- unique(shutin_pool$GSL_UWI)
     valid_ids <- valid_ids[!is.na(valid_ids) & valid_ids != ""]
 
     if (!length(valid_ids)) {
@@ -3831,13 +3918,22 @@ server <- function(input, output, session) {
       .con = con
     )
 
+    prod_error <- FALSE
     prod_raw <- tryCatch(
       DBI::dbGetQuery(con, prod_sql),
       error = function(e) {
-        message("ERROR pulling production: ", e$message)
+        message("SHUTIN DEBUG: production query failed: ", e$message)
+        prod_error <<- TRUE
         data.frame()
       }
     )
+
+    if (isTRUE(prod_error)) {
+      reactive_vals$shutin_summary <- data.table::data.table()
+      reactive_vals$shutin_detail <- data.table::data.table()
+      showNotification("Production query failed, cannot calculate shut-in wells right now.", type = "error", duration = 6)
+      return(invisible(NULL))
+    }
 
     prod_dt <- data.table::as.data.table(prod_raw)
 
@@ -3910,7 +4006,7 @@ server <- function(input, output, session) {
     }
 
     shutin_candidates <- merge(
-      wells_base,
+      shutin_pool,
       window_stats,
       by = "GSL_UWI",
       all.x = TRUE,
@@ -3926,6 +4022,11 @@ server <- function(input, output, session) {
 
     shutin_candidates[is.na(RECENT_VOL_BOE), RECENT_VOL_BOE := 0]
     shutin_candidates[is.na(SILENT_VOL_BOE), SILENT_VOL_BOE := 0]
+    shutin_candidates[, ProvinceState := toupper(trimws(as.character(ProvinceState)))]
+    shutin_candidates[ProvinceState %in% c("B.C.", "BC.", "B C", "BRITISH COLUMBIA", "B.C", "B C."), ProvinceState := "BC"]
+    shutin_candidates[ProvinceState %in% c("ALBERTA", "ALTA", "AB.", "AB "), ProvinceState := "AB"]
+    shutin_candidates[ProvinceState %in% c("SASK", "SASKATCHEWAN", "SK.", "SK "), ProvinceState := "SK"]
+    shutin_candidates[, ProvinceState := trimws(ProvinceState)]
     shutin_candidates[, LAST_PROD_MONTH := as.Date(LAST_PROD_MONTH)]
     shutin_candidates[, MonthsSinceLastProd := ifelse(
       is.na(LAST_PROD_MONTH),
@@ -3952,6 +4053,7 @@ server <- function(input, output, session) {
     shutin_summary <- shutin_flagged[
       , .(SHUTIN_WELL_COUNT = .N), by = .(OperatorName)
     ][order(-SHUTIN_WELL_COUNT, OperatorName)]
+    shutin_summary[, SnapshotDate := snapshot_date]
 
     shutin_detail <- shutin_flagged[, .(
       SnapshotDate = snapshot_date,
@@ -3959,6 +4061,9 @@ server <- function(input, output, session) {
       GSL_UWI,
       OperatorName,
       ProvinceState,
+      Formation,
+      FieldName,
+      RigReleaseDate = as.Date(RigReleaseDate),
       SpudDate = as.Date(SpudDate),
       FirstProdDate = as.Date(FirstProdDate),
       LAST_PROD_MONTH,
@@ -3967,6 +4072,7 @@ server <- function(input, output, session) {
       SILENT_VOL_BOE,
       AbandonmentDate = as.Date(AbandonmentDate),
       CurrentStatus,
+      NoProductionMonthsThreshold = no_prod_months,
       ShutIn = TRUE
     )]
 
@@ -4018,7 +4124,7 @@ server <- function(input, output, session) {
     req(!is.null(detail_dt))
     validate(need(nrow(detail_dt) > 0, "No shut-in wells match the current criteria."))
 
-    detail_dt[order(SnapshotDate, OperatorName, ProvinceState, GSL_UWI)]
+    detail_dt[order(SnapshotDate, OperatorName, ProvinceState, Formation, FieldName, GSL_UWI)]
   },
   options = list(pageLength = 25, scrollX = TRUE),
   rownames = FALSE)
@@ -4030,7 +4136,7 @@ server <- function(input, output, session) {
       if (is.null(dt) || !nrow(dt)) {
         data.table::fwrite(data.table::data.table(), file)
       } else {
-        data.table::fwrite(dt, file)
+        data.table::fwrite(dt[order(SnapshotDate, -SHUTIN_WELL_COUNT, OperatorName)], file)
       }
     }
   )
@@ -4042,7 +4148,10 @@ server <- function(input, output, session) {
       if (is.null(dt) || !nrow(dt)) {
         data.table::fwrite(data.table::data.table(), file)
       } else {
-        data.table::fwrite(dt[order(SnapshotDate, OperatorName, ProvinceState, GSL_UWI)], file)
+        data.table::fwrite(
+          dt[order(SnapshotDate, OperatorName, ProvinceState, Formation, FieldName, GSL_UWI)],
+          file
+        )
       }
     }
   )
