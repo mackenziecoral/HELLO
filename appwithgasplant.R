@@ -1154,7 +1154,7 @@ ui <- fluidPage(
 
                                 sliderInput(
                                   "duc_min_hold_days",
-                                  "Min days since rig release (or spud if rig release missing) to count as DUC",
+                                  "Min days since rig release to count as DUC",
                                   min = 0,
                                   max = 180,
                                   value = 30,
@@ -1163,7 +1163,7 @@ ui <- fluidPage(
 
                                 sliderInput(
                                   "duc_max_hold_days",
-                                  "Max days allowed since rig release/spud (exclude long-term zombies)",
+                                  "Max days allowed since rig release (exclude long-term zombies)",
                                   min = 30,
                                   max = 2000,
                                   value = 730,
@@ -1223,13 +1223,13 @@ ui <- fluidPage(
                                     tags$li(
                                       "For each snapshot date D, a well is counted as a DUC if:",
                                       tags$ul(
-                                        tags$li("The well reached rig release on or before D (RigReleaseDate ≤ D; falls back to SpudDate when RigReleaseDate is missing)."),
+                                        tags$li("The well reached rig release on or before D (RigReleaseDate ≤ D). Wells missing RigReleaseDate are excluded."),
                                         tags$li("The well has NOT started first production on/before D (FirstProdDate is blank OR FirstProdDate > D)."),
                                         tags$li("The well is not abandoned as of D (AbandonmentDate is blank OR AbandonmentDate > D)."),
-                                        tags$li("The well has existed at least [Min days since rig release/spud] days by D."),
-                                        tags$li("The well has existed no more than [Max days allowed since rig release/spud] days by D (drops multi-year zombies / economic suspensions)."),
+                                        tags$li("The well has existed at least [Min days since rig release] days by D."),
+                                        tags$li("The well has existed no more than [Max days allowed since rig release] days by D (drops multi-year zombies / economic suspensions)."),
                                         tags$li("The well was rig-released within the last [Recency window in months] months as of D (optional high-grading for current programs)."),
-                                        tags$li("The well has not exceeded [Max months between rig release and first production] months with no first production (prevents including very old inventory)."),
+                                        tags$li("The gap between rig release and first production is within [Max months between rig release and first production] months (prevents including very old inventory)."),
                                         tags$li("If 'Exclude wells flagged Confidential' is checked, wells flagged Confidential are dropped.")
                                       )
                                     ),
@@ -1718,7 +1718,7 @@ server <- function(input, output, session) {
   ) {
     d <- as.Date(snap_date)
 
-    drill_done_date <- data.table::fcoalesce(dt$RigReleaseDate, dt$SpudDate)
+    drill_done_date <- as.Date(dt$RigReleaseDate)
 
     # Core conditions
     drilled_before_snap <- !is.na(drill_done_date) & drill_done_date <= d
@@ -1740,10 +1740,10 @@ server <- function(input, output, session) {
     recent_enough <- !is.na(age_days) & (age_days <= recency_days)
 
     # 4. Maximum months between drill finish and first production cap
-    first_prod_diff_days <- ifelse(
+    first_prod_diff_days <- data.table::fifelse(
       is.na(drill_done_date),
       NA_real_,
-      ifelse(
+      data.table::fifelse(
         is.na(dt$FirstProdDate),
         0,
         pmax(0, as.numeric(dt$FirstProdDate - drill_done_date))
@@ -1800,54 +1800,40 @@ server <- function(input, output, session) {
 
     out <- data.table::copy(wx_dt[keep_mask])
 
-    # audit columns
     out[, SnapshotDate := d]
-    out[, DrillDoneDate := data.table::fcoalesce(RigReleaseDate, SpudDate)]
-    out[, DaysSinceRelease := as.numeric(SnapshotDate - DrillDoneDate)]
-    out[, MonthsSinceRelease := round(DaysSinceRelease / 30.4375, 1)]
-    out[, `:=`(
-      MonthsBetweenReleaseAndFirstProd = {
-        diff_days <- ifelse(
-          is.na(DrillDoneDate),
-          NA_real_,
-          ifelse(is.na(FirstProdDate), 0, pmax(0, as.numeric(FirstProdDate - DrillDoneDate)))
-        )
-        round(diff_days / 30.4375, 1)
-      },
-      MonthsBetweenReleaseAndFirstProd_raw = {
-        diff_days <- ifelse(
-          is.na(DrillDoneDate),
-          NA_real_,
-          ifelse(is.na(FirstProdDate), 0, pmax(0, as.numeric(FirstProdDate - DrillDoneDate)))
-        )
-        diff_days / 30.4375
-      }
-    )]
-    out[, MinHold_OK := DaysSinceRelease >= as.numeric(min_hold_days)]
-    out[, MaxHold_OK := DaysSinceRelease <= as.numeric(max_hold_days)]
-    out[, InRecencyWindow := DaysSinceRelease <= as.numeric(recency_months) * 30.4375]
-    out[, MaxMonthsCap_OK := data.table::fifelse(
-      is.na(MonthsBetweenReleaseAndFirstProd_raw),
-      FALSE,
-      MonthsBetweenReleaseAndFirstProd_raw <= as.numeric(max_months_cap)
-    )]
-    out[, NotOnProd := (is.na(FirstProdDate) | FirstProdDate > SnapshotDate)]
-    out[, NotAbandoned := (is.na(AbandonmentDate) | AbandonmentDate > SnapshotDate)]
-    out[, ConfidentialFlag := ifelse(is.na(ConfidentialType) | ConfidentialType == "", "No", "Yes")]
-    out[, HasProducedYet := !is.na(FirstProdDate) & FirstProdDate <= SnapshotDate]
-    out[, IsCountedAsDUC := TRUE]
+    out[, RigReleaseDate := as.Date(RigReleaseDate)]
+    out[, SpudDate := as.Date(SpudDate)]
+    out[, FirstProdDate := as.Date(FirstProdDate)]
+    out[, AbandonmentDate := as.Date(AbandonmentDate)]
 
-    # grouping label used downstream
+    out[, DaysSinceRelease := as.numeric(SnapshotDate - RigReleaseDate)]
+    out[, RecencyMonths := round(DaysSinceRelease / 30.4375, 1)]
+    out[, GapMonths := {
+      diff_days <- data.table::fifelse(
+        is.na(RigReleaseDate),
+        NA_real_,
+        data.table::fifelse(is.na(FirstProdDate), 0, pmax(0, as.numeric(FirstProdDate - RigReleaseDate)))
+      )
+      round(diff_days / 30.4375, 1)
+    }]
+
     grp <- group_col
     out[, Group := {
       val <- get(grp)
       ifelse(is.na(val) | val == "", "(Unknown)", as.character(val))
     }]
 
+    if (!"GSL_UWI" %in% names(out)) {
+      if ("GSL_UWI_Std" %in% names(out)) {
+        out[, GSL_UWI := GSL_UWI_Std]
+      } else {
+        out[, GSL_UWI := UWI]
+      }
+    }
+
     out <- out[, .(
       UWI,
-      Group,
-      GSL_UWI_Std,
+      GSL_UWI,
       OperatorName,
       ProvinceState,
       Formation,
@@ -1857,22 +1843,79 @@ server <- function(input, output, session) {
       FirstProdDate,
       AbandonmentDate,
       SnapshotDate,
-      DrillDoneDate,
       DaysSinceRelease,
-      MonthsSinceRelease,
-      MonthsBetweenReleaseAndFirstProd,
-      MinHold_OK,
-      MaxHold_OK,
-      InRecencyWindow,
-      MaxMonthsCap_OK,
-      NotOnProd,
-      NotAbandoned,
-      ConfidentialFlag,
-      HasProducedYet,
-      IsCountedAsDUC
+      RecencyMonths,
+      GapMonths,
+      Group
     )]
     out
   }
+
+  duc_candidate_wells <- reactive({
+    req(wells_sf_global)
+    if (!inherits(wells_sf_global, "sf")) return(data.table::data.table())
+
+    dt <- data.table::as.data.table(sf::st_drop_geometry(wells_sf_global))
+
+    if (!"UWI" %in% names(dt)) dt[, UWI := NA_character_]
+    if (!"GSL_UWI" %in% names(dt)) {
+      if ("GSL_UWI_Std" %in% names(dt)) {
+        dt[, GSL_UWI := GSL_UWI_Std]
+      } else {
+        dt[, GSL_UWI := UWI]
+      }
+    }
+    for (col in c("OperatorName", "ProvinceState", "Formation", "FieldName", "ConfidentialType")) {
+      if (!col %in% names(dt)) dt[, (col) := NA_character_]
+      dt[, (col) := as.character(get(col))]
+    }
+    for (col in c("SpudDate", "RigReleaseDate", "FirstProdDate", "AbandonmentDate")) {
+      if (!col %in% names(dt)) dt[, (col) := as.Date(NA)]
+      dt[, (col) := as.Date(get(col))]
+    }
+
+    filtered_dt <- data.table::copy(dt)
+
+    if (!is.null(input$operator_filter) && length(input$operator_filter) > 0 && "OperatorName" %in% names(filtered_dt)) {
+      sel <- input$operator_filter
+      if ("(Unknown)" %in% sel) {
+        keep_ops <- setdiff(sel, "(Unknown)")
+        filtered_dt <- filtered_dt[(is.na(OperatorName) | OperatorName == "" | OperatorName %in% keep_ops)]
+      } else {
+        filtered_dt <- filtered_dt[!is.na(OperatorName) & OperatorName %in% sel]
+      }
+    }
+
+    if (!is.null(input$formation_filter) && length(input$formation_filter) > 0 && "Formation" %in% names(filtered_dt)) {
+      filtered_dt <- filtered_dt[!is.na(Formation) & Formation %in% input$formation_filter]
+    }
+
+    if (!is.null(input$field_filter) && length(input$field_filter) > 0 && "FieldName" %in% names(filtered_dt)) {
+      filtered_dt <- filtered_dt[!is.na(FieldName) & FieldName %in% input$field_filter]
+    }
+
+    if (!is.null(input$province_filter) && length(input$province_filter) > 0 && "ProvinceState" %in% names(filtered_dt)) {
+      filtered_dt <- filtered_dt[!is.na(ProvinceState) & ProvinceState %in% input$province_filter]
+    }
+
+    if (isTRUE(input$duc_exclude_conf) && "ConfidentialType" %in% names(filtered_dt)) {
+      filtered_dt <- filtered_dt[is.na(ConfidentialType) | ConfidentialType == ""]
+    }
+
+    filtered_dt[, .(
+      UWI,
+      GSL_UWI,
+      OperatorName,
+      ProvinceState,
+      Formation,
+      FieldName,
+      SpudDate,
+      RigReleaseDate,
+      FirstProdDate,
+      AbandonmentDate,
+      ConfidentialType
+    )]
+  })
 
   fetch_monthly_production_totals <- function(uwi_vec, date_start, date_end) {
     if (length(uwi_vec) == 0) return(data.table::data.table())
@@ -3412,81 +3455,143 @@ server <- function(input, output, session) {
     }
   )
 
-  observeEvent(input$duc_apply, {
-    req(wells_sf_global)
-    req(nrow(wells_sf_global) > 0)
-
-    # get user inputs safely
+  duc_long_dt <- eventReactive(input$duc_apply, {
     snap_dates <- sort(unique(as.Date(input$duc_dates)))
     req(length(snap_dates) > 0)
 
+    candidate <- duc_candidate_wells()
+    if (is.null(candidate) || !nrow(candidate)) {
+      return(data.table::data.table(
+        UWI = character(),
+        GSL_UWI = character(),
+        OperatorName = character(),
+        ProvinceState = character(),
+        Formation = character(),
+        FieldName = character(),
+        RigReleaseDate = as.Date(character()),
+        SpudDate = as.Date(character()),
+        FirstProdDate = as.Date(character()),
+        AbandonmentDate = as.Date(character()),
+        ConfidentialType = character(),
+        SnapshotDate = as.Date(character()),
+        DaysSinceRelease = numeric(),
+        RecencyMonths = numeric(),
+        GapMonths = numeric(),
+        Group = character()
+      ))
+    }
+
     grp_col <- input$duc_group_by
-    if (is.null(grp_col) || !(grp_col %in% c("OperatorName","Formation","FieldName","ProvinceState"))) {
+    if (is.null(grp_col) || !(grp_col %in% c("OperatorName", "Formation", "FieldName", "ProvinceState"))) {
       grp_col <- "OperatorName"
     }
 
     min_hold_days <- as.numeric(input$duc_min_hold_days %||% 30)
-    max_hold_days  <- as.numeric(input$duc_max_hold_days %||% 730)
+    max_hold_days <- as.numeric(input$duc_max_hold_days %||% 730)
     recency_months <- as.numeric(input$duc_spud_recency_months %||% 36)
     max_months_cap <- as.numeric(input$duc_max_months_cap %||% 24)
-    exclude_conf  <- isTRUE(input$duc_exclude_conf)
 
-    base_sf <- reactive_vals$wells_filtered_base
-    if (is.null(base_sf) || !inherits(base_sf, "sf") || nrow(base_sf) == 0) {
-      base_sf <- wells_sf_global
-    }
-    req(inherits(base_sf, "sf"), nrow(base_sf) > 0)
+    candidate <- data.table::copy(candidate)
+    candidate[, RigReleaseDate := as.Date(RigReleaseDate)]
+    candidate[, SpudDate := as.Date(SpudDate)]
+    candidate[, FirstProdDate := as.Date(FirstProdDate)]
+    candidate[, AbandonmentDate := as.Date(AbandonmentDate)]
 
-    wx_raw <- data.table::as.data.table(sf::st_drop_geometry(base_sf))
-    if ("GSL_UWI_STD" %in% names(wx_raw) && !"GSL_UWI_Std" %in% names(wx_raw)) data.table::setnames(wx_raw, "GSL_UWI_STD", "GSL_UWI_Std")
-    if ("GSL_UWI" %in% names(wx_raw) && !"GSL_UWI_Std" %in% names(wx_raw)) wx_raw[, GSL_UWI_Std := standardize_uwi(GSL_UWI)]
-    if (!"GSL_UWI_Std" %in% names(wx_raw)) wx_raw[, GSL_UWI_Std := NA_character_]
-    if (!"UWI" %in% names(wx_raw)) wx_raw[, UWI := GSL_UWI_Std]
-    if (!"ConfidentialType" %in% names(wx_raw)) wx_raw[, ConfidentialType := NA_character_]
-    if (!"RigReleaseDate" %in% names(wx_raw)) wx_raw[, RigReleaseDate := as.Date(NA)]
+    detail_list <- lapply(snap_dates, function(d) {
+      working <- data.table::copy(candidate)
+      working <- working[!is.na(RigReleaseDate)]
+      working <- working[RigReleaseDate <= d]
+      working <- working[is.na(FirstProdDate) | FirstProdDate > d]
+      working <- working[is.na(AbandonmentDate) | AbandonmentDate > d]
+      if (!nrow(working)) return(data.table::data.table())
 
-    wx <- wx_raw[
-      , .(
-          UWI               = UWI %||% NA_character_,
-          GSL_UWI_Std       = GSL_UWI_Std %||% NA_character_,
-          OperatorName      = OperatorName %||% NA_character_,
-          Formation         = Formation %||% NA_character_,
-          FieldName         = FieldName %||% NA_character_,
-          ProvinceState     = ProvinceState %||% NA_character_,
-          SpudDate          = as.Date(SpudDate),
-          RigReleaseDate    = as.Date(RigReleaseDate),
-          FirstProdDate     = as.Date(FirstProdDate),
-          AbandonmentDate   = as.Date(AbandonmentDate),
-          ConfidentialType  = ConfidentialType %||% NA_character_
-        )
-    ]
+      working[, DaysSinceRelease := as.numeric(d - RigReleaseDate)]
+      working <- working[!is.na(DaysSinceRelease)]
+      working <- working[DaysSinceRelease >= as.numeric(min_hold_days) & DaysSinceRelease <= as.numeric(max_hold_days)]
+      if (!nrow(working)) return(data.table::data.table())
 
-    detail_list <- lapply(
-      snap_dates,
-      function(sd) duc_detail_for_date(
-        wx_dt           = wx,
-        snap_date       = sd,
-        min_hold_days   = min_hold_days,
-        max_hold_days   = max_hold_days,
-        recency_months  = recency_months,
-        max_months_cap  = max_months_cap,
-        exclude_conf    = exclude_conf,
-        group_col       = grp_col
+      working[, RecencyMonths := DaysSinceRelease / 30.4375]
+      working <- working[RecencyMonths <= as.numeric(recency_months)]
+      if (!nrow(working)) return(data.table::data.table())
+
+      working[, GapMonths := data.table::fifelse(
+        is.na(FirstProdDate),
+        0,
+        pmax(0, as.numeric(FirstProdDate - RigReleaseDate)) / 30.4375
+      )]
+      working <- working[!is.na(GapMonths) & GapMonths <= as.numeric(max_months_cap)]
+      if (!nrow(working)) return(data.table::data.table())
+
+      working[, SnapshotDate := d]
+      working[, DaysSinceRelease := as.numeric(DaysSinceRelease)]
+      working[, RecencyMonths := round(RecencyMonths, 1)]
+      working[, GapMonths := round(GapMonths, 1)]
+
+      working[, Group := {
+        val <- get(grp_col)
+        ifelse(is.na(val) | val == "", "(Unknown)", as.character(val))
+      }]
+
+      working[, .(
+        UWI,
+        GSL_UWI,
+        OperatorName,
+        ProvinceState,
+        Formation,
+        FieldName,
+        RigReleaseDate,
+        SpudDate,
+        FirstProdDate,
+        AbandonmentDate,
+        ConfidentialType,
+        SnapshotDate,
+        DaysSinceRelease,
+        RecencyMonths,
+        GapMonths,
+        Group
+      )]
+    })
+
+    detail_dt <- data.table::rbindlist(detail_list, use.names = TRUE, fill = TRUE)
+    if (!nrow(detail_dt)) {
+      detail_dt <- data.table::data.table(
+        UWI = character(),
+        GSL_UWI = character(),
+        OperatorName = character(),
+        ProvinceState = character(),
+        Formation = character(),
+        FieldName = character(),
+        RigReleaseDate = as.Date(character()),
+        SpudDate = as.Date(character()),
+        FirstProdDate = as.Date(character()),
+        AbandonmentDate = as.Date(character()),
+        ConfidentialType = character(),
+        SnapshotDate = as.Date(character()),
+        DaysSinceRelease = numeric(),
+        RecencyMonths = numeric(),
+        GapMonths = numeric(),
+        Group = character()
       )
-    )
-    duc_detail_dt <- data.table::rbindlist(detail_list, use.names = TRUE, fill = TRUE)
-
-    reactive_vals$duc_detail <- duc_detail_dt
-
-    if (nrow(duc_detail_dt)) {
-      duc_comp_dt <- duc_detail_dt[, .(DUC_Count = .N), by = .(Group, SnapshotDate)][order(SnapshotDate, -DUC_Count)]
-    } else {
-      duc_comp_dt <- data.table::data.table(Group = character(0), DUC_Count = integer(0), SnapshotDate = as.Date(character(0)))
     }
 
-    reactive_vals$duc_comp <- duc_comp_dt
-    reactive_vals$duc_groups_available <- if (nrow(duc_comp_dt)) sort(unique(duc_comp_dt$Group)) else character(0)
+    detail_dt
   })
+
+  duc_summary_dt <- reactive({
+    detail_dt <- duc_long_dt()
+    if (is.null(detail_dt) || !nrow(detail_dt)) {
+      return(data.table::data.table(Group = character(), SnapshotDate = as.Date(character()), DUC_Count = integer()))
+    }
+    detail_copy <- data.table::copy(detail_dt)
+    data.table::setorder(detail_copy, SnapshotDate)
+    detail_copy[, .(DUC_Count = .N), by = .(Group, SnapshotDate)][order(SnapshotDate, -DUC_Count)]
+  })
+
+  observeEvent(duc_summary_dt(), {
+    dt <- duc_summary_dt()
+    groups <- if (!is.null(dt) && nrow(dt) > 0) sort(unique(dt$Group)) else character(0)
+    reactive_vals$duc_groups_available <- groups
+  }, ignoreNULL = FALSE)
 
   output$duc_group_filter_ui <- renderUI({
     groups <- reactive_vals$duc_groups_available
@@ -3501,7 +3606,7 @@ server <- function(input, output, session) {
   })
 
   output$duc_headline <- renderText({
-    dt <- reactive_vals$duc_comp
+    dt <- duc_summary_dt()
     if (is.null(dt) || !nrow(dt)) {
       return("No DUC results yet. Pick snapshot dates and click Calculate.")
     }
@@ -3518,7 +3623,7 @@ server <- function(input, output, session) {
   })
 
   output$duc_bar_compare <- plotly::renderPlotly({
-    dt <- reactive_vals$duc_comp
+    dt <- duc_summary_dt()
     req(!is.null(dt), nrow(dt) > 0)
 
     if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
@@ -3558,7 +3663,7 @@ server <- function(input, output, session) {
   })
 
   output$duc_table <- DT::renderDT({
-    dt <- reactive_vals$duc_comp
+    dt <- duc_summary_dt()
     req(!is.null(dt), nrow(dt) > 0)
     if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
       dt <- dt[Group %in% input$duc_group_filter]
@@ -3574,8 +3679,8 @@ server <- function(input, output, session) {
   output$duc_download <- downloadHandler(
     filename = function() paste0("duc_summary_", Sys.Date(), ".csv"),
     content = function(file) {
-      sum_dt <- reactive_vals$duc_comp
-      det_dt <- reactive_vals$duc_detail
+      sum_dt <- duc_summary_dt()
+      det_dt <- duc_long_dt()
       if (is.null(sum_dt) || !nrow(sum_dt)) {
         data.table::fwrite(sum_dt, file)
         return()
@@ -3597,7 +3702,7 @@ server <- function(input, output, session) {
   )
 
   output$duc_detail_table <- DT::renderDT({
-    dt <- reactive_vals$duc_detail
+    dt <- duc_long_dt()
     req(!is.null(dt), nrow(dt) > 0)
     if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
       dt <- dt[Group %in% input$duc_group_filter]
@@ -3614,7 +3719,7 @@ server <- function(input, output, session) {
   output$download_duc_details_csv <- downloadHandler(
     filename = function() paste0("duc_detail_", Sys.Date(), ".csv"),
     content = function(file) {
-      dt <- reactive_vals$duc_detail
+      dt <- duc_long_dt()
       if (is.null(dt) || !nrow(dt)) {
         data.table::fwrite(data.table::data.table(), file)
         return()
