@@ -630,7 +630,7 @@ geometric_mean <- function(x, na.rm = TRUE) {
 final_sf_column_names <- c(
   "UWI", "GSL_UWI", "SurfaceLatitude", "SurfaceLongitude",
   "BH_Latitude", "BH_Longitude", "LateralLength",
-  "AbandonmentDate", "WellName", "CurrentStatus", "OperatorCode", "StratUnitID",
+  "AbandonmentDate", "CompletionDate", "WellName", "CurrentStatus", "OperatorCode", "StratUnitID",
   "SpudDate", "RigReleaseDate", "FirstProdDate", "FinalTD", "ProvinceState", "Country",
   "UWI_Std", "GSL_UWI_Std", "OperatorName", "Formation", "FieldName",
   "ConfidentialType", "LicensedSubstance"
@@ -641,7 +641,7 @@ empty_wells_df_for_sf$UWI <- character(); empty_wells_df_for_sf$GSL_UWI <- chara
 empty_wells_df_for_sf$SurfaceLatitude <- numeric(); empty_wells_df_for_sf$SurfaceLongitude <- numeric()
 empty_wells_df_for_sf$BH_Latitude <- numeric(); empty_wells_df_for_sf$BH_Longitude <- numeric()
 empty_wells_df_for_sf$LateralLength <- numeric()
-empty_wells_df_for_sf$AbandonmentDate <- as.Date(character()); empty_wells_df_for_sf$WellName <- character()
+empty_wells_df_for_sf$AbandonmentDate <- as.Date(character()); empty_wells_df_for_sf$CompletionDate <- as.Date(character()); empty_wells_df_for_sf$WellName <- character()
 empty_wells_df_for_sf$CurrentStatus <- character(); empty_wells_df_for_sf$OperatorCode <- character()
 empty_wells_df_for_sf$StratUnitID <- character(); empty_wells_df_for_sf$SpudDate <- as.Date(character())
 empty_wells_df_for_sf$RigReleaseDate <- as.Date(character())
@@ -818,18 +818,53 @@ if (load_from_db) {
   }
   message("Rig release join condition: ", wd_join_condition)
 
+  wv_join_condition <- "WV.UWI = W.UWI"
+  if (!is.null(con) && dbIsValid(con)) {
+    wv_cols_upper <- tryCatch({
+      info <- DBI::dbGetQuery(
+        con,
+        "SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE OWNER = 'CLIENT_VIEWS' AND TABLE_NAME = 'WELL_VERSION_V11'"
+      )
+      unique(toupper(info$COLUMN_NAME))
+    }, error = function(e) {
+      sample_cols <- tryCatch({
+        sample_df <- DBI::dbGetQuery(con, "SELECT * FROM CLIENT_VIEWS.WELL_VERSION_V11 WHERE ROWNUM <= 0")
+        if (is.data.frame(sample_df)) unique(toupper(names(sample_df))) else character(0)
+      }, error = function(e2) character(0))
+      sample_cols
+    })
+    if (length(wv_cols_upper)) {
+      if ("UWI" %in% wv_cols_upper) {
+        wv_join_condition <- "WV.UWI = W.UWI"
+      } else if ("GSL_UWI" %in% wv_cols_upper) {
+        wv_join_condition <- "WV.GSL_UWI = W.GSL_UWI"
+      } else if ("GSL_UWI_STD" %in% wv_cols_upper) {
+        wv_join_condition <- "WV.GSL_UWI_STD = W.GSL_UWI"
+      } else {
+        message("WARNING: CLIENT_VIEWS.WELL_VERSION_V11 lacks UWI/GSL_UWI columns; defaulting join to WV.UWI = W.UWI")
+      }
+    } else {
+      message("WARNING: Unable to inspect CLIENT_VIEWS.WELL_VERSION_V11 columns; defaulting join to WV.UWI = W.UWI")
+    }
+  }
+
   sql_well_master_base <- paste0(
     "SELECT W.UWI, W.GSL_UWI, W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE, ",
     "W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE, W.GSL_FULL_LATERAL_LENGTH, ",
-    "W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE, ",
-    "P.STRAT_UNIT_ID, W.SPUD_DATE, WD.RIG_RELEASE_DATE AS RIG_RELEASE_DATE, PFS.FIRST_PROD_DATE, W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, FL.FIELD_NAME, W.LICENSED_SUBSTANCE ",
+    "COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) AS ABANDONMENT_DATE, W.WELL_NAME, ",
+    "COALESCE(WV.CURRENT_STATUS, W.CURRENT_STATUS) AS CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE, ",
+    "P.STRAT_UNIT_ID, COALESCE(WV.SPUD_DATE, W.SPUD_DATE) AS SPUD_DATE, WD.RIG_RELEASE_DATE AS RIG_RELEASE_DATE, ",
+    "COALESCE(PFS.FIRST_PROD_DATE, WV.FIRST_PROD_DATE) AS FIRST_PROD_DATE, ",
+    "COALESCE(WV.COMPLETION_DATE, W.COMPLETION_DATE) AS COMPLETION_DATE, W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, ",
+    "FL.FIELD_NAME, W.LICENSED_SUBSTANCE, WV.LAHEE, WV.LAHEE_CLASS, WV.LAHEE_CLASSIFICATION ",
     "FROM WELL W ",
     "LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI ",
     "LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID ",
     "LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI ",
     "LEFT JOIN CLIENT_VIEWS.WELL_DRILLING_V11 WD ON ", wd_join_condition, " ",
+    "LEFT JOIN CLIENT_VIEWS.WELL_VERSION_V11 WV ON ", wv_join_condition, " ",
     "WHERE W.SURFACE_LATITUDE IS NOT NULL AND W.SURFACE_LONGITUDE IS NOT NULL ",
-    "AND (W.ABANDONMENT_DATE IS NULL OR W.ABANDONMENT_DATE > SYSDATE - (365*20))"
+    "AND (COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) IS NULL OR COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) > SYSDATE - (365*20))"
   )
   message("Fetching well master data from Oracle..."); wells_master_df_raw <- tryCatch({ dbGetQuery(con, sql_well_master_base) }, error = function(e) { warning(paste("Error fetching well master data from Oracle:", e$message)); data.frame() })
   wells_master_dt <- data.table::data.table()
@@ -837,7 +872,20 @@ if (load_from_db) {
     message(paste("DB Load: Successfully loaded", nrow(wells_master_df_raw), "base well rows from DB.")); wells_master_dt <- data.table::as.data.table(wells_master_df_raw)
     if("UWI" %in% names(wells_master_dt)) wells_master_dt[, UWI_Std := standardize_uwi(UWI)] else wells_master_dt[, UWI_Std := NA_character_]
     if("GSL_UWI" %in% names(wells_master_dt)) wells_master_dt[, GSL_UWI_Std := standardize_uwi(GSL_UWI)] else wells_master_dt[, GSL_UWI_Std := NA_character_]
-    if (!"FIELD_NAME" %in% names(wells_master_dt)) { wells_master_dt[, FieldName := NA_character_] } else { setnames(wells_master_dt, "FIELD_NAME", "FieldName") }
+    setnames(wells_master_dt, "FIELD_NAME", "FieldName", skip_absent = TRUE)
+    setnames(wells_master_dt, "LICENSED_SUBSTANCE", "LicensedSubstance", skip_absent = TRUE)
+    setnames(wells_master_dt, "COMPLETION_DATE", "CompletionDate", skip_absent = TRUE)
+    setnames(wells_master_dt, "CURRENT_STATUS", "CurrentStatus", skip_absent = TRUE)
+    setnames(wells_master_dt, "LAHEE", "Lahee", skip_absent = TRUE)
+    setnames(wells_master_dt, "LAHEE_CLASS", "LaheeClass", skip_absent = TRUE)
+    setnames(wells_master_dt, "LAHEE_CLASSIFICATION", "LaheeClassification", skip_absent = TRUE)
+    if (!"FieldName" %in% names(wells_master_dt)) wells_master_dt[, FieldName := NA_character_]
+    if (!"LicensedSubstance" %in% names(wells_master_dt)) wells_master_dt[, LicensedSubstance := NA_character_]
+    if (!"CompletionDate" %in% names(wells_master_dt)) wells_master_dt[, CompletionDate := as.Date(NA)]
+    if (!"CurrentStatus" %in% names(wells_master_dt)) wells_master_dt[, CurrentStatus := NA_character_]
+    if (!"Lahee" %in% names(wells_master_dt)) wells_master_dt[, Lahee := NA_character_]
+    if (!"LaheeClass" %in% names(wells_master_dt)) wells_master_dt[, LaheeClass := NA_character_]
+    if (!"LaheeClassification" %in% names(wells_master_dt)) wells_master_dt[, LaheeClassification := NA_character_]
     if (!"STRAT_UNIT_ID" %in% names(wells_master_dt)) wells_master_dt[, STRAT_UNIT_ID := NA_character_]; wells_master_dt[, STRAT_UNIT_ID := as.character(STRAT_UNIT_ID)]
     
     if ("CONFIDENTIAL_TYPE" %in% names(wells_master_dt)) {
@@ -890,13 +938,14 @@ if (load_from_db) {
       "SURFACE_LONGITUDE"="SurfaceLongitude",
       "BOTTOM_HOLE_LATITUDE"="BH_Latitude", "BOTTOM_HOLE_LONGITUDE"="BH_Longitude",
       "GSL_FULL_LATERAL_LENGTH"="LateralLength", # Updated mapping for LateralLength
-      "ABANDONMENT_DATE"="AbandonmentDate", "WELL_NAME"="WellName", "CURRENT_STATUS"="CurrentStatus",
+      "ABANDONMENT_DATE"="AbandonmentDate", "COMPLETION_DATE"="CompletionDate", "WELL_NAME"="WellName", "CURRENT_STATUS"="CurrentStatus",
       "OPERATOR_CODE"="OperatorCode", "STRAT_UNIT_ID"="StratUnitID",
       "SPUD_DATE"="SpudDate", "RIG_RELEASE_DATE"="RigReleaseDate", "FIRST_PROD_DATE"="FirstProdDate",
       "FINAL_TD"="FinalTD", "PROVINCE_STATE"="ProvinceState", "COUNTRY"="Country",
       "UWI_Std"="UWI_Std", "GSL_UWI_Std"="GSL_UWI_Std",
       "OperatorNameDisplay"="OperatorName", "Formation"="Formation", "FieldName"="FieldName",
-      "CONFIDENTIAL_TYPE"="ConfidentialType", "LICENSED_SUBSTANCE"="LicensedSubstance"
+      "CONFIDENTIAL_TYPE"="ConfidentialType", "LICENSED_SUBSTANCE"="LicensedSubstance",
+      "LAHEE"="Lahee", "LAHEE_CLASS"="LaheeClass", "LAHEE_CLASSIFICATION"="LaheeClassification"
     )
     current_db_names <- names(combined_wells_dt)
     for (db_name in names(db_to_r_names_map)) {
@@ -920,6 +969,12 @@ if (load_from_db) {
         if (col_sf == "ConfidentialType" && !is.character(combined_wells_dt[[col_sf]])) {
           combined_wells_dt[, (col_sf) := as.character(get(col_sf))]
         }
+        if (col_sf == "CurrentStatus" && !is.character(combined_wells_dt[[col_sf]])) {
+          combined_wells_dt[, (col_sf) := as.character(get(col_sf))]
+        }
+        if (col_sf == "LicensedSubstance" && !is.character(combined_wells_dt[[col_sf]])) {
+          combined_wells_dt[, (col_sf) := as.character(get(col_sf))]
+        }
         if (col_sf == "BH_Latitude" && !is.numeric(combined_wells_dt[[col_sf]])) {
           combined_wells_dt[, (col_sf) := as.numeric(get(col_sf))]
         }
@@ -934,7 +989,7 @@ if (load_from_db) {
     
     if("SurfaceLatitude" %in% names(combined_wells_dt) && !is.numeric(combined_wells_dt$SurfaceLatitude)) combined_wells_dt[, SurfaceLatitude := as.numeric(SurfaceLatitude)]
     if("SurfaceLongitude" %in% names(combined_wells_dt) && !is.numeric(combined_wells_dt$SurfaceLongitude)) combined_wells_dt[, SurfaceLongitude := as.numeric(SurfaceLongitude)]
-    date_cols_to_convert_pascal <- c("SpudDate", "RigReleaseDate", "FirstProdDate", "AbandonmentDate")
+    date_cols_to_convert_pascal <- c("SpudDate", "RigReleaseDate", "FirstProdDate", "AbandonmentDate", "CompletionDate")
     for(dc_pascal in date_cols_to_convert_pascal){ if(dc_pascal %in% names(combined_wells_dt) && !inherits(combined_wells_dt[[dc_pascal]], "Date")){ current_col_values <- combined_wells_dt[[dc_pascal]]; if(inherits(current_col_values, "POSIXct") || inherits(current_col_values, "POSIXlt")) { combined_wells_dt[, (dc_pascal) := as.Date(current_col_values)] } else { combined_wells_dt[, (dc_pascal) := as.Date(as.character(current_col_values), origin = "1970-01-01")] } } }
     combined_wells_for_sf <- combined_wells_dt[!is.na(SurfaceLatitude) & !is.na(SurfaceLongitude)]
     if (nrow(combined_wells_for_sf) > 0) {
@@ -1355,6 +1410,24 @@ ui <- fluidPage(
                                   step = 1
                                 ),
 
+                                numericInput(
+                                  "duc_grace_days",
+                                  "Grace after release (days):",
+                                  value = 30,
+                                  min = 0,
+                                  max = 365,
+                                  step = 5
+                                ),
+
+                                numericInput(
+                                  "duc_max_age_days",
+                                  "Max age since release (days, 0 = none):",
+                                  value = 0,
+                                  min = 0,
+                                  max = 3650,
+                                  step = 30
+                                ),
+
                                 sliderInput(
                                   "duc_max_months_cap",
                                   "Max months between rig release and first production to still call it 'DUC' (ignore wells that have been sitting longer than this many months without first production)",
@@ -1382,6 +1455,13 @@ ui <- fluidPage(
                                   "duc_include_unknown_substance",
                                   "Include Unknown commodity",
                                   value = TRUE
+                                ),
+
+                                selectInput(
+                                  "duc_lahee_filter",
+                                  "Lahee classification",
+                                  choices = c("All", "Development"),
+                                  selected = "All"
                                 ),
 
                                 selectInput(
@@ -1416,6 +1496,7 @@ ui <- fluidPage(
                                         tags$li("The well reached rig release on or before D (RigReleaseDate ≤ D), falling back to SpudDate only when RigReleaseDate is missing."),
                                         tags$li("The well has NOT started first production on/before D (FirstProdDate is blank OR FirstProdDate > D)."),
                                         tags$li("The well is not abandoned as of D (AbandonmentDate is blank OR AbandonmentDate > D)."),
+                                        tags$li("The well is not completed as of D (CompletionDate is blank OR CompletionDate > D)."),
                                         tags$li("The well has existed at least [Min days since rig release] days by D."),
                                         tags$li("The well has existed no more than [Max days allowed since rig release] days by D (drops multi-year zombies / economic suspensions)."),
                                         tags$li("The well was rig-released within the last [Recency window in months] months as of D (optional high-grading for current programs)."),
@@ -1563,6 +1644,8 @@ server <- function(input, output, session) {
     duc_detail = data.table::data.table(),
     duc_groups_available = character(0),
     duc_substance_choices = character(0),
+    lahee_notice_shown = FALSE,
+    completion_notice_shown = FALSE,
     shutin_summary = data.table::data.table(),
     shutin_detail = data.table::data.table(),
     shutin_snapshot = as.Date(NA),
@@ -1931,7 +2014,9 @@ server <- function(input, output, session) {
     max_hold_days      = 730L,
     recency_months     = 36L,
     max_months_cap     = 24L,
-    exclude_conf       = TRUE
+    exclude_conf       = TRUE,
+    grace_days         = 0L,
+    max_age_days       = 0L
   ) {
     d <- as.Date(snap_date)
 
@@ -1940,21 +2025,39 @@ server <- function(input, output, session) {
     # Core conditions
     drilled_before_snap <- !is.na(drill_done_date) & drill_done_date <= d
     not_on_prod_yet     <- (is.na(dt$FirstProdDate) | dt$FirstProdDate > d)
-    not_abandoned       <- (is.na(dt$AbandonmentDate) | dt$AbandonmentDate > d)
+    completion_date     <- as.Date(dt$CompletionDate)
+    completed_by_snap   <- !is.na(completion_date) & completion_date <= d
+    status_norm <- tolower(trimws(as.character(dt$CurrentStatus)))
+    status_not_abandoned <- is.na(status_norm) | !grepl("abd|aband", status_norm, perl = TRUE)
+    not_abandoned       <- (is.na(dt$AbandonmentDate) | dt$AbandonmentDate > d) & status_not_abandoned
 
     # Age since drilling finished (rig release or spud fallback) at snapshot
     age_days <- as.numeric(d - drill_done_date)
 
+    grace_days <- max(0, as.numeric(grace_days))
+    min_hold_days <- max(0, as.numeric(min_hold_days))
+    effective_min <- max(min_hold_days, grace_days)
     # 1. Minimum hold threshold (exclude wells that are too fresh after drill finish)
-    long_enough <- !is.na(age_days) & (age_days >= as.numeric(min_hold_days))
+    long_enough <- !is.na(age_days) & (age_days >= effective_min)
 
     # 2. Maximum hold threshold (exclude zombie wells that have sat for years)
-    not_too_old <- !is.na(age_days) & (age_days <= as.numeric(max_hold_days))
+    max_hold_days <- as.numeric(max_hold_days)
+    max_age_days <- as.numeric(max_age_days)
+    max_cap <- if (is.na(max_hold_days) || max_hold_days <= 0) Inf else max_hold_days
+    if (!is.na(max_age_days) && max_age_days > 0) {
+      max_cap <- min(max_cap, max_age_days)
+    }
+    not_too_old <- !is.na(age_days) & age_days <= max_cap
 
     # 3. Recency filter: drill finish must be within the last N months at snapshot
     #    Convert months to ~30.4375 days for a rough but consistent cutoff.
-    recency_days <- as.numeric(recency_months) * 30.4375
-    recent_enough <- !is.na(age_days) & (age_days <= recency_days)
+    recency_months <- as.numeric(recency_months)
+    if (is.na(recency_months) || recency_months <= 0) {
+      recent_enough <- TRUE
+    } else {
+      recency_days <- recency_months * 30.4375
+      recent_enough <- !is.na(age_days) & (age_days <= recency_days)
+    }
 
     # 4. Maximum months between drill finish and first production cap
     first_prod_diff_days <- data.table::fifelse(
@@ -1967,8 +2070,13 @@ server <- function(input, output, session) {
       )
     )
     months_between_release_and_firstprod <- first_prod_diff_days / 30.4375
-    within_month_cap <- !is.na(months_between_release_and_firstprod) &
-      (months_between_release_and_firstprod <= as.numeric(max_months_cap))
+    max_months_cap <- as.numeric(max_months_cap)
+    if (is.na(max_months_cap) || max_months_cap <= 0) {
+      within_month_cap <- !is.na(months_between_release_and_firstprod)
+    } else {
+      within_month_cap <- !is.na(months_between_release_and_firstprod) &
+        (months_between_release_and_firstprod <= max_months_cap)
+    }
 
     # Confidential filter
     if (exclude_conf) {
@@ -1982,6 +2090,7 @@ server <- function(input, output, session) {
     drilled_before_snap &
       not_on_prod_yet &
       not_abandoned &
+      !completed_by_snap &
       long_enough &
       not_too_old &
       recent_enough &
@@ -1997,7 +2106,9 @@ server <- function(input, output, session) {
     recency_months,
     max_months_cap,
     exclude_conf,
-    group_col
+    group_col,
+    grace_days,
+    max_age_days
   ) {
     d <- as.Date(snap_date)
 
@@ -2008,7 +2119,9 @@ server <- function(input, output, session) {
       max_hold_days  = max_hold_days,
       recency_months = recency_months,
       max_months_cap = max_months_cap,
-      exclude_conf   = exclude_conf
+      exclude_conf   = exclude_conf,
+      grace_days     = grace_days,
+      max_age_days   = max_age_days
     )
 
     if (!any(keep_mask, na.rm = TRUE)) {
@@ -2023,10 +2136,11 @@ server <- function(input, output, session) {
     out[, DrillDoneDate := data.table::fcoalesce(RigReleaseDate, SpudDate)]
     out[, FirstProdDate := as.Date(FirstProdDate)]
     out[, AbandonmentDate := as.Date(AbandonmentDate)]
+    out[, CompletionDate := as.Date(CompletionDate)]
 
-    out[, DaysSinceRelease := as.numeric(SnapshotDate - DrillDoneDate)]
-    out[, RecencyMonths := round(DaysSinceRelease / 30.4375, 1)]
-    out[, GapMonths := {
+    out[, DaysSinceRigRelease := as.numeric(SnapshotDate - DrillDoneDate)]
+    out[, MonthsSinceRigRelease := round(DaysSinceRigRelease / 30.4375, 1)]
+    out[, MonthsBetweenReleaseAndFirstProd := {
       diff_days <- data.table::fifelse(
         is.na(DrillDoneDate),
         NA_real_,
@@ -2050,6 +2164,15 @@ server <- function(input, output, session) {
     }
 
     if (!"LicensedSubstance" %in% names(out)) out[, LicensedSubstance := NA_character_]
+    if (!"CurrentStatus" %in% names(out)) out[, CurrentStatus := NA_character_]
+
+    out[, StatusNorm := tolower(trimws(as.character(CurrentStatus)))]
+    out[, CompletedBySnapshot := !is.na(CompletionDate) & CompletionDate <= SnapshotDate]
+    out[, FirstProdBySnapshot := !is.na(FirstProdDate) & FirstProdDate <= SnapshotDate]
+    out[, AbandonedBySnapshot := (!is.na(AbandonmentDate) & AbandonmentDate <= SnapshotDate) |
+         (!is.na(StatusNorm) & grepl("abd|aband", StatusNorm, perl = TRUE))]
+    out[, StatusNorm := NULL]
+    out[, FailedBecause := NA_character_]
 
     out <- out[, .(
       UWI,
@@ -2058,16 +2181,22 @@ server <- function(input, output, session) {
       ProvinceState,
       Formation,
       FieldName,
+      CurrentStatus,
       SpudDate,
       RigReleaseDate,
       DrillDoneDate,
+      CompletionDate,
       FirstProdDate,
       AbandonmentDate,
       LicensedSubstance,
       SnapshotDate,
-      DaysSinceRelease,
-      RecencyMonths,
-      GapMonths,
+      DaysSinceRigRelease,
+      MonthsSinceRigRelease,
+      MonthsBetweenReleaseAndFirstProd,
+      CompletedBySnapshot,
+      FirstProdBySnapshot,
+      AbandonedBySnapshot,
+      FailedBecause,
       Group
     )]
     out
@@ -2087,11 +2216,11 @@ server <- function(input, output, session) {
         dt[, GSL_UWI := UWI]
       }
     }
-    for (col in c("OperatorName", "ProvinceState", "Formation", "FieldName", "ConfidentialType", "LicensedSubstance")) {
+    for (col in c("OperatorName", "ProvinceState", "Formation", "FieldName", "ConfidentialType", "LicensedSubstance", "CurrentStatus")) {
       if (!col %in% names(dt)) dt[, (col) := NA_character_]
       dt[, (col) := as.character(get(col))]
     }
-    for (col in c("SpudDate", "RigReleaseDate", "FirstProdDate", "AbandonmentDate")) {
+    for (col in c("SpudDate", "RigReleaseDate", "FirstProdDate", "AbandonmentDate", "CompletionDate")) {
       if (!col %in% names(dt)) dt[, (col) := as.Date(NA)]
       dt[, (col) := as.Date(get(col))]
     }
@@ -2151,6 +2280,24 @@ server <- function(input, output, session) {
     filtered_dt[, LicensedSubstance := toupper(trimws(LicensedSubstance))]
     filtered_dt[is.na(LicensedSubstance) | LicensedSubstance == "", LicensedSubstance := "UNKNOWN"]
 
+    if (!"CompletionDate" %in% names(filtered_dt) || (all(is.na(filtered_dt$CompletionDate)) && !reactive_vals$completion_notice_shown)) {
+      showNotification("CompletionDate column missing or empty; completion gating may be skipped.", type = "message", duration = 6)
+      reactive_vals$completion_notice_shown <- TRUE
+    }
+
+    lahee_cols <- c("Lahee", "LaheeClass", "LaheeClassification", "LAHEE", "LAHEE_CLASS", "LAHEE_CLASSIFICATION")
+    lahee_col <- lahee_cols[lahee_cols %in% names(filtered_dt)][1]
+    if (!is.null(lahee_col)) {
+      filtered_dt[, LaheeNormalized := toupper(trimws(as.character(get(lahee_col))))]
+      if (identical(input$duc_lahee_filter, "Development")) {
+        filtered_dt <- filtered_dt[LaheeNormalized == "DEVELOPMENT"]
+      }
+      filtered_dt[, LaheeNormalized := NULL]
+    } else if (!isTRUE(reactive_vals$lahee_notice_shown)) {
+      showNotification("Lahee column not found in this environment; DUC counts are not filtered by Development.", type = "message", duration = 6)
+      reactive_vals$lahee_notice_shown <- TRUE
+    }
+
     choices <- sort(unique(filtered_dt$LicensedSubstance))
     reactive_vals$duc_substance_choices <- choices
 
@@ -2171,8 +2318,10 @@ server <- function(input, output, session) {
       ProvinceState,
       Formation,
       FieldName,
+      CurrentStatus,
       SpudDate,
       RigReleaseDate,
+      CompletionDate,
       FirstProdDate,
       AbandonmentDate,
       ConfidentialType,
@@ -3772,8 +3921,8 @@ server <- function(input, output, session) {
 
     required_cols <- c(
       "UWI", "GSL_UWI", "OperatorName", "ProvinceState", "Formation", "FieldName",
-      "RigReleaseDate", "SpudDate", "FirstProdDate", "AbandonmentDate", "ConfidentialType",
-      "LicensedSubstance"
+      "RigReleaseDate", "SpudDate", "CompletionDate", "FirstProdDate", "AbandonmentDate", "ConfidentialType",
+      "LicensedSubstance", "CurrentStatus"
     )
     for (col in required_cols) {
       if (!col %in% names(candidate)) {
@@ -3781,10 +3930,10 @@ server <- function(input, output, session) {
       }
     }
 
-    for (col in intersect(required_cols, c("OperatorName", "ProvinceState", "Formation", "FieldName", "ConfidentialType", "LicensedSubstance"))) {
+    for (col in intersect(required_cols, c("OperatorName", "ProvinceState", "Formation", "FieldName", "ConfidentialType", "LicensedSubstance", "CurrentStatus"))) {
       candidate[, (col) := as.character(get(col))]
     }
-    for (col in c("RigReleaseDate", "SpudDate", "FirstProdDate", "AbandonmentDate")) {
+    for (col in c("RigReleaseDate", "SpudDate", "CompletionDate", "FirstProdDate", "AbandonmentDate")) {
       candidate[, (col) := as.Date(get(col))]
     }
 
@@ -3823,83 +3972,34 @@ server <- function(input, output, session) {
     max_hold_days <- as.numeric(input$duc_max_hold_days %||% 730)
     recency_months <- as.numeric(input$duc_spud_recency_months %||% 36)
     max_months_cap <- as.numeric(input$duc_max_months_cap %||% 24)
+    grace_days <- as.numeric(input$duc_grace_days %||% 0)
+    max_age_days <- as.numeric(input$duc_max_age_days %||% 0)
+    exclude_conf <- isTRUE(input$duc_exclude_conf)
 
     detail_list <- lapply(snap_dates, function(d) {
       working <- data.table::copy(duc_pool)
-      working[, DrillDoneDate := data.table::fcoalesce(RigReleaseDate, SpudDate)]
-      working[, FirstProdDate := as.Date(FirstProdDate)]
-      working[, AbandonmentDate := as.Date(AbandonmentDate)]
-      working <- working[!is.na(DrillDoneDate) & DrillDoneDate <= d]
-      working <- working[is.na(FirstProdDate) | FirstProdDate > d]
-      working <- working[is.na(AbandonmentDate) | AbandonmentDate > d]
-      if (!nrow(working)) return(data.table::data.table())
-
-      working[, DaysSinceRigRelease := as.numeric(d - DrillDoneDate)]
-      working <- working[!is.na(DaysSinceRigRelease)]
-      working <- working[
-        DaysSinceRigRelease >= as.numeric(min_hold_days) &
-          DaysSinceRigRelease <= as.numeric(max_hold_days)
-      ]
-      if (!nrow(working)) return(data.table::data.table())
-
-      working[, MonthsSinceRigRelease := DaysSinceRigRelease / 30.4375]
-      working <- working[MonthsSinceRigRelease <= as.numeric(recency_months)]
-      if (!nrow(working)) return(data.table::data.table())
-
-      working[, MonthsBetweenReleaseAndFirstProd := data.table::fifelse(
-        is.na(FirstProdDate),
-        0,
-        pmax(0, as.numeric(FirstProdDate - DrillDoneDate)) / 30.4375
+      detail_dt <- duc_detail_for_date(
+        wx_dt = working,
+        snap_date = d,
+        min_hold_days = min_hold_days,
+        max_hold_days = max_hold_days,
+        recency_months = recency_months,
+        max_months_cap = max_months_cap,
+        exclude_conf = exclude_conf,
+        group_col = grp_col,
+        grace_days = grace_days,
+        max_age_days = max_age_days
+      )
+      if (!nrow(detail_dt)) return(data.table::data.table())
+      detail_dt[, DaysSinceRigRelease := round(DaysSinceRigRelease, 0)]
+      detail_dt[, MonthsSinceRigRelease := round(MonthsSinceRigRelease, 1)]
+      detail_dt[, MonthsBetweenReleaseAndFirstProd := round(MonthsBetweenReleaseAndFirstProd, 1)]
+      detail_dt[, RuleMatch := data.table::fifelse(
+        FirstProdBySnapshot,
+        "FirstProdAfterSnapshot",
+        "NoFirstProd + WithinReleaseWindows"
       )]
-      working <- working[
-        !is.na(MonthsBetweenReleaseAndFirstProd) &
-          MonthsBetweenReleaseAndFirstProd <= as.numeric(max_months_cap)
-      ]
-      if (!nrow(working)) return(data.table::data.table())
-
-      working[, SnapshotDate := d]
-      working[, DaysSinceRigRelease := round(DaysSinceRigRelease, 0)]
-      working[, MonthsSinceRigRelease := round(MonthsSinceRigRelease, 1)]
-      working[, MonthsBetweenReleaseAndFirstProd := round(MonthsBetweenReleaseAndFirstProd, 1)]
-      working[, DaysSinceRelease := DaysSinceRigRelease]
-      working[, RecencyMonths := MonthsSinceRigRelease]
-      working[, GapMonths := MonthsBetweenReleaseAndFirstProd]
-
-      working[, Group := {
-        val <- get(grp_col)
-        ifelse(is.na(val) | val == "", "(Unknown)", as.character(val))
-      }]
-
-      working[, RuleMatch := data.table::fifelse(
-        is.na(FirstProdDate),
-        "NoFirstProd + WithinReleaseWindows",
-        "FirstProdAfterSnapshot"
-      )]
-
-      working[, .(
-        UWI,
-        GSL_UWI,
-        OperatorName,
-        ProvinceState,
-        Formation,
-        FieldName,
-        RigReleaseDate,
-        SpudDate,
-        DrillDoneDate,
-        FirstProdDate,
-        AbandonmentDate,
-        ConfidentialType,
-        LicensedSubstance,
-        SnapshotDate,
-        DaysSinceRigRelease,
-        MonthsSinceRigRelease,
-        MonthsBetweenReleaseAndFirstProd,
-        DaysSinceRelease,
-        RecencyMonths,
-        GapMonths,
-        Group,
-        RuleMatch
-      )]
+      detail_dt
     })
 
     detail_dt <- data.table::rbindlist(detail_list, use.names = TRUE, fill = TRUE)
@@ -3911,9 +4011,11 @@ server <- function(input, output, session) {
         ProvinceState = character(),
         Formation = character(),
         FieldName = character(),
+        CurrentStatus = character(),
         RigReleaseDate = as.Date(character()),
         SpudDate = as.Date(character()),
         DrillDoneDate = as.Date(character()),
+        CompletionDate = as.Date(character()),
         FirstProdDate = as.Date(character()),
         AbandonmentDate = as.Date(character()),
         ConfidentialType = character(),
@@ -3922,9 +4024,10 @@ server <- function(input, output, session) {
         DaysSinceRigRelease = numeric(),
         MonthsSinceRigRelease = numeric(),
         MonthsBetweenReleaseAndFirstProd = numeric(),
-        DaysSinceRelease = numeric(),
-        RecencyMonths = numeric(),
-        GapMonths = numeric(),
+        CompletedBySnapshot = logical(),
+        FirstProdBySnapshot = logical(),
+        AbandonedBySnapshot = logical(),
+        FailedBecause = character(),
         Group = character(),
         RuleMatch = character()
       )
@@ -4096,7 +4199,7 @@ server <- function(input, output, session) {
         req(nrow(dt) > 0)
         DT::datatable(
           dt[, .(UWI, OperatorName, ProvinceState, Formation, FieldName,
-                 RigReleaseDate, FirstProdDate, AbandonmentDate, SnapshotDate)],
+                 RigReleaseDate, CompletionDate, FirstProdDate, AbandonmentDate, SnapshotDate)],
           options = list(server = TRUE, deferRender = TRUE, pageLength = 50, scrollX = TRUE),
           filter = "top",
           rownames = FALSE
@@ -4223,6 +4326,13 @@ server <- function(input, output, session) {
     shutin_pool[ProvinceState %in% c("ALBERTA", "ALTA", "AB.", "AB "), ProvinceState := "AB"]
     shutin_pool[ProvinceState %in% c("SASK", "SASKATCHEWAN", "SK.", "SK "), ProvinceState := "SK"]
     shutin_pool[, ProvinceState := trimws(ProvinceState)]
+
+    shutin_pool[, CurrentStatus := as.character(CurrentStatus)]
+    shutin_pool[, CurrentStatusNorm := tolower(trimws(CurrentStatus))]
+    shutin_pool[, is_abandoned := (!is.na(AbandonmentDate) & AbandonmentDate <= snapshot_date) |
+                                  (!is.na(CurrentStatusNorm) & grepl("abd|aband", CurrentStatusNorm, perl = TRUE))]
+    shutin_pool <- shutin_pool[!is_abandoned]
+    shutin_pool[, c("CurrentStatusNorm", "is_abandoned") := NULL]
 
     message("SHUTIN DEBUG: unique ProvinceState in shut-in candidate pool:")
     print(sort(unique(shutin_pool$ProvinceState)))
