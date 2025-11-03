@@ -27,6 +27,29 @@ library(plotly)
 # ==== Gas Plant: constants & helpers ====
 `%||%` <- function(x, y) { if (is.null(x) || length(x) == 0) return(y); x }
 
+safe_col <- function(DT, candidates) {
+  if (is.null(DT)) return(NULL)
+  nms <- names(DT)
+  picks <- candidates[candidates %in% nms]
+  if (length(picks)) picks[1] else NULL
+}
+
+col_or_const <- function(DT, candidates, default = NA_character_) {
+  nm <- safe_col(DT, candidates)
+  if (is.null(nm)) {
+    len <- if (is.null(DT)) 0L else nrow(DT)
+    return(rep_len(default, len))
+  }
+  DT[[nm]]
+}
+
+norm_uwi <- function(x) {
+  if (is.null(x)) return(character(0))
+  x_chr <- as.character(x)
+  x_chr <- gsub("[^A-Za-z0-9]", "", x_chr)
+  toupper(x_chr)
+}
+
 resolve_existing_dir <- function(candidates, fallback = ".") {
   candidates <- unique(trimws(candidates))
   candidates <- candidates[!is.na(candidates) & candidates != ""]
@@ -870,8 +893,6 @@ if (load_from_db) {
   wells_master_dt <- data.table::data.table()
   if (nrow(wells_master_df_raw) > 0) {
     message(paste("DB Load: Successfully loaded", nrow(wells_master_df_raw), "base well rows from DB.")); wells_master_dt <- data.table::as.data.table(wells_master_df_raw)
-    if("UWI" %in% names(wells_master_dt)) wells_master_dt[, UWI_Std := standardize_uwi(UWI)] else wells_master_dt[, UWI_Std := NA_character_]
-    if("GSL_UWI" %in% names(wells_master_dt)) wells_master_dt[, GSL_UWI_Std := standardize_uwi(GSL_UWI)] else wells_master_dt[, GSL_UWI_Std := NA_character_]
     setnames(wells_master_dt, "FIELD_NAME", "FieldName", skip_absent = TRUE)
     setnames(wells_master_dt, "LICENSED_SUBSTANCE", "LicensedSubstance", skip_absent = TRUE)
     setnames(wells_master_dt, "COMPLETION_DATE", "CompletionDate", skip_absent = TRUE)
@@ -879,13 +900,53 @@ if (load_from_db) {
     setnames(wells_master_dt, "LAHEE", "Lahee", skip_absent = TRUE)
     setnames(wells_master_dt, "LAHEE_CLASS", "LaheeClass", skip_absent = TRUE)
     setnames(wells_master_dt, "LAHEE_CLASSIFICATION", "LaheeClassification", skip_absent = TRUE)
+    setnames(wells_master_dt, "SPUD_DATE", "SpudDate", skip_absent = TRUE)
+    setnames(wells_master_dt, "RIG_RELEASE_DATE", "RigReleaseDate", skip_absent = TRUE)
+    setnames(wells_master_dt, "FIRST_PROD_DATE", "FirstProdDate", skip_absent = TRUE)
+    setnames(wells_master_dt, "ABANDONMENT_DATE", "AbandonmentDate", skip_absent = TRUE)
+    if("UWI" %in% names(wells_master_dt)) wells_master_dt[, UWI := norm_uwi(UWI)]
+    if("GSL_UWI" %in% names(wells_master_dt)) wells_master_dt[, GSL_UWI := norm_uwi(GSL_UWI)]
+    if("UWI" %in% names(wells_master_dt)) wells_master_dt[, UWI_Std := standardize_uwi(UWI)] else wells_master_dt[, UWI_Std := NA_character_]
+    if("GSL_UWI" %in% names(wells_master_dt)) wells_master_dt[, GSL_UWI_Std := standardize_uwi(GSL_UWI)] else wells_master_dt[, GSL_UWI_Std := NA_character_]
+    date_cols_master <- intersect(c("SpudDate", "RigReleaseDate", "CompletionDate", "FirstProdDate", "AbandonmentDate"), names(wells_master_dt))
+    for (dc in date_cols_master) wells_master_dt[, (dc) := as.IDate(get(dc))]
     if (!"FieldName" %in% names(wells_master_dt)) wells_master_dt[, FieldName := NA_character_]
     if (!"LicensedSubstance" %in% names(wells_master_dt)) wells_master_dt[, LicensedSubstance := NA_character_]
-    if (!"CompletionDate" %in% names(wells_master_dt)) wells_master_dt[, CompletionDate := as.Date(NA)]
+    if (!"CompletionDate" %in% names(wells_master_dt)) wells_master_dt[, CompletionDate := as.IDate(NA)]
     if (!"CurrentStatus" %in% names(wells_master_dt)) wells_master_dt[, CurrentStatus := NA_character_]
     if (!"Lahee" %in% names(wells_master_dt)) wells_master_dt[, Lahee := NA_character_]
     if (!"LaheeClass" %in% names(wells_master_dt)) wells_master_dt[, LaheeClass := NA_character_]
     if (!"LaheeClassification" %in% names(wells_master_dt)) wells_master_dt[, LaheeClassification := NA_character_]
+
+    rig_release_fallback_df <- tryCatch({
+      DBI::dbGetQuery(
+        con,
+        'SELECT UWI, "Date Rig Released" AS DATE_RIG_RELEASED FROM CLIENT_VIEWS.WELL_DRILLING_V11 WHERE "Date Rig Released" IS NOT NULL'
+      )
+    }, error = function(e) {
+      message("DUC DEBUG: Rig release fallback query failed: ", e$message)
+      data.frame()
+    })
+    if (nrow(rig_release_fallback_df) > 0) {
+      rig_release_dt <- data.table::as.data.table(rig_release_fallback_df)
+      rig_release_dt[, UWI := norm_uwi(UWI)]
+      rig_release_dt[, DATE_RIG_RELEASED := as.IDate(DATE_RIG_RELEASED)]
+      rig_release_dt <- rig_release_dt[!is.na(DATE_RIG_RELEASED)]
+      if (nrow(rig_release_dt)) {
+        rig_release_dt <- rig_release_dt[, .(DATE_RIG_RELEASED = max(DATE_RIG_RELEASED, na.rm = TRUE)), by = UWI]
+        if (!"RigReleaseDate" %in% names(wells_master_dt)) wells_master_dt[, RigReleaseDate := as.IDate(NA)]
+        setkey(rig_release_dt, UWI)
+        setkey(wells_master_dt, UWI)
+        wells_master_dt <- rig_release_dt[wells_master_dt]
+        wells_master_dt[, RigReleaseDate := data.table::fifelse(is.na(RigReleaseDate), DATE_RIG_RELEASED, RigReleaseDate)]
+        wells_master_dt[, DATE_RIG_RELEASED := NULL]
+        setkey(wells_master_dt, NULL)
+        message("DUC DEBUG: RigReleaseDate NA count after fallback join: ",
+                sum(is.na(wells_master_dt$RigReleaseDate)), " / ", nrow(wells_master_dt))
+      }
+    } else {
+      message("DUC DEBUG: Rig release fallback query returned no rows; continuing with existing RigReleaseDate values.")
+    }
     if (!"STRAT_UNIT_ID" %in% names(wells_master_dt)) wells_master_dt[, STRAT_UNIT_ID := NA_character_]; wells_master_dt[, STRAT_UNIT_ID := as.character(STRAT_UNIT_ID)]
     
     if ("CONFIDENTIAL_TYPE" %in% names(wells_master_dt)) {
@@ -2240,7 +2301,7 @@ server <- function(input, output, session) {
     print(sort(unique(filtered_dt$ProvinceState)))
     message("DUC DEBUG: Province counts BEFORE DUC rules:")
     print(table(filtered_dt$ProvinceState, useNA = 'ifany'))
-    message("DUC DEBUG: RigReleaseDate NA rate by Province:")
+    message("DUC DEBUG: RigReleaseDate NA rate by Province (after fallback join):")
     print(table(filtered_dt$ProvinceState, is.na(filtered_dt$RigReleaseDate), useNA = 'ifany'))
     message("DUC DEBUG: ConfidentialType by Province:")
     print(table(filtered_dt$ProvinceState, filtered_dt$ConfidentialType, useNA = 'ifany'))
@@ -2252,6 +2313,9 @@ server <- function(input, output, session) {
                     FieldName, Formation)],
       20
     ))
+
+    filtered_dt[, LicensedSubstance := toupper(trimws(col_or_const(filtered_dt, c("LicensedSubstance", "LICENSED_SUBSTANCE"))))]
+    filtered_dt[is.na(LicensedSubstance) | LicensedSubstance == "", LicensedSubstance := "UNKNOWN"]
 
     if (!is.null(input$operator_filter) && length(input$operator_filter) > 0 && "OperatorName" %in% names(filtered_dt)) {
       sel <- input$operator_filter
@@ -2279,27 +2343,23 @@ server <- function(input, output, session) {
       filtered_dt <- filtered_dt[is.na(ConfidentialType) | ConfidentialType == ""]
     }
 
-    if (!"LicensedSubstance" %in% names(filtered_dt)) filtered_dt[, LicensedSubstance := NA_character_]
-    filtered_dt[, LicensedSubstance := toupper(trimws(LicensedSubstance))]
-    filtered_dt[is.na(LicensedSubstance) | LicensedSubstance == "", LicensedSubstance := "UNKNOWN"]
-
     if (!"CompletionDate" %in% names(filtered_dt) || (all(is.na(filtered_dt$CompletionDate)) && !reactive_vals$completion_notice_shown)) {
       showNotification("CompletionDate column missing or empty; completion gating may be skipped.", type = "message", duration = 6)
       reactive_vals$completion_notice_shown <- TRUE
     }
 
-    lahee_cols <- c("Lahee", "LaheeClass", "LaheeClassification", "LAHEE", "LAHEE_CLASS", "LAHEE_CLASSIFICATION")
-    lahee_col <- lahee_cols[lahee_cols %in% names(filtered_dt)][1]
-    if (!is.null(lahee_col)) {
-      filtered_dt[, LaheeNormalized := toupper(trimws(as.character(get(lahee_col))))]
-      if (identical(input$duc_lahee_filter, "Development")) {
-        filtered_dt <- filtered_dt[LaheeNormalized == "DEVELOPMENT"]
+    lahee_candidates <- c("Lahee", "LaheeClass", "LaheeClassification", "LAHEE", "LAHEE_CLASS", "LAHEE_CLASSIFICATION")
+    filtered_dt[, LaheeResolved := toupper(trimws(col_or_const(filtered_dt, lahee_candidates)))]
+    has_lahee <- any(!is.na(filtered_dt$LaheeResolved) & filtered_dt$LaheeResolved != "")
+    if (identical(input$duc_lahee_filter, "Development")) {
+      if (has_lahee) {
+        filtered_dt <- filtered_dt[LaheeResolved == "DEVELOPMENT"]
+      } else if (!isTRUE(reactive_vals$lahee_notice_shown)) {
+        showNotification("Lahee column not found in this environment; DUC counts are not filtered by Development.", type = "message", duration = 6)
+        reactive_vals$lahee_notice_shown <- TRUE
       }
-      filtered_dt[, LaheeNormalized := NULL]
-    } else if (!isTRUE(reactive_vals$lahee_notice_shown)) {
-      showNotification("Lahee column not found in this environment; DUC counts are not filtered by Development.", type = "message", duration = 6)
-      reactive_vals$lahee_notice_shown <- TRUE
     }
+    filtered_dt[, LaheeResolved := NULL]
 
     choices <- sort(unique(filtered_dt$LicensedSubstance))
     reactive_vals$duc_substance_choices <- choices
