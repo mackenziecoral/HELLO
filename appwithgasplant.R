@@ -2150,8 +2150,11 @@ server <- function(input, output, session) {
     }]
 
     grp <- group_col
+    if (is.null(grp) || length(grp) != 1 || is.na(grp) || !grp %in% names(out)) {
+      grp <- "OperatorName"
+    }
     out[, Group := {
-      val <- get(grp)
+      val <- .SD[[grp]]
       ifelse(is.na(val) | val == "", "(Unknown)", as.character(val))
     }]
 
@@ -3964,7 +3967,8 @@ server <- function(input, output, session) {
     ))
 
     grp_col <- input$duc_group_by
-    if (is.null(grp_col) || !(grp_col %in% c("OperatorName", "Formation", "FieldName", "ProvinceState"))) {
+    if (is.null(grp_col) || length(grp_col) != 1 || is.na(grp_col) ||
+        !(grp_col %in% c("OperatorName", "Formation", "FieldName", "ProvinceState"))) {
       grp_col <- "OperatorName"
     }
 
