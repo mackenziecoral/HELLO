@@ -918,6 +918,10 @@ if (load_from_db) {
     if (!"LaheeClass" %in% names(wells_master_dt)) wells_master_dt[, LaheeClass := NA_character_]
     if (!"LaheeClassification" %in% names(wells_master_dt)) wells_master_dt[, LaheeClassification := NA_character_]
 
+    wells_master_dt[, LaheeUnified := toupper(trimws(
+      col_or_const(wells_master_dt, c("Lahee", "LaheeClass", "LaheeClassification"))
+    ))]
+
     rig_release_fallback_df <- tryCatch({
       DBI::dbGetQuery(
         con,
@@ -2210,14 +2214,16 @@ server <- function(input, output, session) {
       round(diff_days / 30.4375, 1)
     }]
 
-    grp <- group_col
-    if (is.null(grp) || length(grp) != 1 || is.na(grp) || !grp %in% names(out)) {
-      grp <- "OperatorName"
+    grp <- safe_col(out, c(group_col, "OperatorName"))
+    if (is.null(grp)) {
+      out[, Group := "(Unknown)"]
+    } else {
+      out[, Group := {
+        vals <- .SD[[1]]
+        vals <- ifelse(is.na(vals) | trimws(as.character(vals)) == "", "(Unknown)", as.character(vals))
+        vals
+      }, .SDcols = grp]
     }
-    out[, Group := {
-      val <- .SD[[grp]]
-      ifelse(is.na(val) | val == "", "(Unknown)", as.character(val))
-    }]
 
     if (!"GSL_UWI" %in% names(out)) {
       if ("GSL_UWI_Std" %in% names(out)) {
@@ -2228,6 +2234,11 @@ server <- function(input, output, session) {
     }
 
     if (!"LicensedSubstance" %in% names(out)) out[, LicensedSubstance := NA_character_]
+    if (!"LaheeUnified" %in% names(out)) {
+      out[, LaheeUnified := toupper(trimws(col_or_const(out, c("LaheeUnified", "Lahee", "LaheeClass", "LaheeClassification"))))]
+    } else {
+      out[, LaheeUnified := toupper(trimws(as.character(LaheeUnified)))]
+    }
     if (!"CurrentStatus" %in% names(out)) out[, CurrentStatus := NA_character_]
 
     out[, StatusNorm := tolower(trimws(as.character(CurrentStatus)))]
@@ -2253,6 +2264,7 @@ server <- function(input, output, session) {
       FirstProdDate,
       AbandonmentDate,
       LicensedSubstance,
+      LaheeUnified,
       SnapshotDate,
       DaysSinceRigRelease,
       MonthsSinceRigRelease,
@@ -2289,6 +2301,9 @@ server <- function(input, output, session) {
       dt[, (col) := as.Date(get(col))]
     }
 
+    lahee_vals_dt <- col_or_const(dt, c("LaheeUnified", "Lahee", "LaheeClass", "LaheeClassification"))
+    dt[, LaheeUnified := toupper(trimws(as.character(lahee_vals_dt)))]
+
     filtered_dt <- data.table::copy(dt)
 
     filtered_dt[, ProvinceState := toupper(trimws(as.character(ProvinceState)))]
@@ -2316,6 +2331,9 @@ server <- function(input, output, session) {
 
     filtered_dt[, LicensedSubstance := toupper(trimws(col_or_const(filtered_dt, c("LicensedSubstance", "LICENSED_SUBSTANCE"))))]
     filtered_dt[is.na(LicensedSubstance) | LicensedSubstance == "", LicensedSubstance := "UNKNOWN"]
+
+    lahee_vals <- col_or_const(filtered_dt, c("LaheeUnified", "Lahee", "LaheeClass", "LaheeClassification"))
+    filtered_dt[, LaheeUnified := toupper(trimws(as.character(lahee_vals)))]
 
     if (!is.null(input$operator_filter) && length(input$operator_filter) > 0 && "OperatorName" %in% names(filtered_dt)) {
       sel <- input$operator_filter
@@ -2348,18 +2366,15 @@ server <- function(input, output, session) {
       reactive_vals$completion_notice_shown <- TRUE
     }
 
-    lahee_candidates <- c("Lahee", "LaheeClass", "LaheeClassification", "LAHEE", "LAHEE_CLASS", "LAHEE_CLASSIFICATION")
-    filtered_dt[, LaheeResolved := toupper(trimws(col_or_const(filtered_dt, lahee_candidates)))]
-    has_lahee <- any(!is.na(filtered_dt$LaheeResolved) & filtered_dt$LaheeResolved != "")
+    has_lahee <- any(!is.na(filtered_dt$LaheeUnified) & filtered_dt$LaheeUnified != "")
     if (identical(input$duc_lahee_filter, "Development")) {
       if (has_lahee) {
-        filtered_dt <- filtered_dt[LaheeResolved == "DEVELOPMENT"]
+        filtered_dt <- filtered_dt[LaheeUnified == "DEVELOPMENT"]
       } else if (!isTRUE(reactive_vals$lahee_notice_shown)) {
         showNotification("Lahee column not found in this environment; DUC counts are not filtered by Development.", type = "message", duration = 6)
         reactive_vals$lahee_notice_shown <- TRUE
       }
     }
-    filtered_dt[, LaheeResolved := NULL]
 
     choices <- sort(unique(filtered_dt$LicensedSubstance))
     reactive_vals$duc_substance_choices <- choices
@@ -2388,7 +2403,8 @@ server <- function(input, output, session) {
       FirstProdDate,
       AbandonmentDate,
       ConfidentialType,
-      LicensedSubstance
+      LicensedSubstance,
+      LaheeUnified
     )]
   })
 
@@ -3971,8 +3987,11 @@ server <- function(input, output, session) {
         RigReleaseDate = as.Date(character()),
         SpudDate = as.Date(character()),
         DrillDoneDate = as.Date(character()),
+        CompletionDate = as.Date(character()),
         FirstProdDate = as.Date(character()),
         AbandonmentDate = as.Date(character()),
+        LicensedSubstance = character(),
+        LaheeUnified = character(),
         ConfidentialType = character(),
         SnapshotDate = as.Date(character()),
         DaysSinceRigRelease = numeric(),
@@ -4026,10 +4045,14 @@ server <- function(input, output, session) {
       20
     ))
 
-    grp_col <- input$duc_group_by
-    if (is.null(grp_col) || length(grp_col) != 1 || is.na(grp_col) ||
-        !(grp_col %in% c("OperatorName", "Formation", "FieldName", "ProvinceState"))) {
+    group_candidates <- unique(c(input$duc_group_by, "OperatorName", "Formation", "FieldName", "ProvinceState"))
+    group_candidates <- group_candidates[!is.na(group_candidates)]
+    grp_col <- safe_col(duc_pool, group_candidates)
+    if (is.null(grp_col)) {
       grp_col <- "OperatorName"
+      if (!"OperatorName" %in% names(duc_pool)) {
+        duc_pool[, OperatorName := NA_character_]
+      }
     }
 
     min_hold_days <- as.numeric(input$duc_min_hold_days %||% 30)
@@ -4084,6 +4107,7 @@ server <- function(input, output, session) {
         AbandonmentDate = as.Date(character()),
         ConfidentialType = character(),
         LicensedSubstance = character(),
+        LaheeUnified = character(),
         SnapshotDate = as.Date(character()),
         DaysSinceRigRelease = numeric(),
         MonthsSinceRigRelease = numeric(),
@@ -4306,7 +4330,7 @@ server <- function(input, output, session) {
       dt <- dt[Group %in% input$duc_group_filter]
     }
     req(nrow(dt) > 0)
-    dt <- dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, FieldName, LicensedSubstance, DrillDoneDate, UWI)]
+    dt <- dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, FieldName, LicensedSubstance, LaheeUnified, DrillDoneDate, UWI)]
     DT::datatable(
       dt,
       rownames = FALSE,
@@ -4326,7 +4350,7 @@ server <- function(input, output, session) {
         dt <- dt[Group %in% input$duc_group_filter]
       }
       data.table::fwrite(
-        dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, FieldName, LicensedSubstance, DrillDoneDate, UWI)],
+        dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, FieldName, LicensedSubstance, LaheeUnified, DrillDoneDate, UWI)],
         file
       )
     }
