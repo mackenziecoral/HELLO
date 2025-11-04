@@ -433,11 +433,15 @@ reshape_pden_monthlies <- function(pden_dt) {
   long_dt[is.na(PROD_DATE), PROD_DATE := as.Date(NA)]
   long_dt <- long_dt[!is.na(PROD_DATE)]
 
-  long_dt[, .(
+  out <- long_dt[, .(
     OilBBL = sum(ifelse(PRODUCT_TYPE == "OIL", VOLUME, 0), na.rm = TRUE),
     CndBBL = sum(ifelse(PRODUCT_TYPE == "CND", VOLUME, 0), na.rm = TRUE),
     GasMCF = sum(ifelse(PRODUCT_TYPE == "GAS", VOLUME, 0), na.rm = TRUE)
   ), by = .(GSL_UWI, PROD_DATE)]
+
+  if (!nrow(out)) return(out)
+  for (col in c("OilBBL", "CndBBL", "GasMCF")) out[is.na(get(col)), (col) := 0]
+  out
 }
 
 infer_first_prod_date <- function(monthly_dt, threshold_boe = 3, mcf_per_boe = MCF_PER_BOE) {
@@ -815,7 +819,7 @@ if (load_from_db) {
   
   if (is.null(con) || !dbIsValid(con)) { message("Attempting to (re)connect to database for data loading..."); con <- connect_to_db(); if (is.null(con) || !dbIsValid(con)) { stop("FATAL: Database connection failed. Cannot load primary data.") } }
 
-  wd_join_condition <- "WD.UWI = W.UWI"
+  wd_join_condition <- "(WD.GSL_UWI = W.GSL_UWI OR WD.UWI = W.UWI)"
   if (!is.null(con) && dbIsValid(con)) {
     wd_cols_upper <- tryCatch({
       info <- DBI::dbGetQuery(
@@ -838,14 +842,8 @@ if (load_from_db) {
     })
 
     if (length(wd_cols_upper)) {
-      if ("UWI" %in% wd_cols_upper) {
-        wd_join_condition <- "WD.UWI = W.UWI"
-      } else if ("GSL_UWI" %in% wd_cols_upper) {
-        wd_join_condition <- "WD.GSL_UWI = W.GSL_UWI"
-      } else if ("GSL_UWI_STD" %in% wd_cols_upper) {
-        wd_join_condition <- "WD.GSL_UWI_STD = W.GSL_UWI"
-      } else {
-        message("WARNING: CLIENT_VIEWS.WELL_DRILLING_V11 lacks UWI/GSL_UWI columns; defaulting rig release join to WD.UWI = W.UWI")
+      if (!any(wd_cols_upper %in% c("UWI", "GSL_UWI", "GSL_UWI_STD"))) {
+        message("WARNING: CLIENT_VIEWS.WELL_DRILLING_V11 lacks explicit UWI/GSL_UWI columns; using fallback OR join on UWI")
       }
     } else {
       message("WARNING: Unable to inspect CLIENT_VIEWS.WELL_DRILLING_V11 columns; defaulting rig release join to WD.UWI = W.UWI")
@@ -853,7 +851,7 @@ if (load_from_db) {
   }
   message("Rig release join condition: ", wd_join_condition)
 
-  wv_join_condition <- "WV.UWI = W.UWI"
+  wv_join_condition <- "(WV.GSL_UWI = W.GSL_UWI OR WV.UWI = W.UWI)"
   if (!is.null(con) && dbIsValid(con)) {
     wv_cols_upper <- tryCatch({
       info <- DBI::dbGetQuery(
@@ -869,19 +867,15 @@ if (load_from_db) {
       sample_cols
     })
     if (length(wv_cols_upper)) {
-      if ("UWI" %in% wv_cols_upper) {
-        wv_join_condition <- "WV.UWI = W.UWI"
-      } else if ("GSL_UWI" %in% wv_cols_upper) {
-        wv_join_condition <- "WV.GSL_UWI = W.GSL_UWI"
-      } else if ("GSL_UWI_STD" %in% wv_cols_upper) {
-        wv_join_condition <- "WV.GSL_UWI_STD = W.GSL_UWI"
-      } else {
-        message("WARNING: CLIENT_VIEWS.WELL_VERSION_V11 lacks UWI/GSL_UWI columns; defaulting join to WV.UWI = W.UWI")
+      if (!any(wv_cols_upper %in% c("UWI", "GSL_UWI", "GSL_UWI_STD"))) {
+        message("WARNING: CLIENT_VIEWS.WELL_VERSION_V11 lacks explicit UWI/GSL_UWI columns; using fallback OR join on UWI")
       }
     } else {
       message("WARNING: Unable to inspect CLIENT_VIEWS.WELL_VERSION_V11 columns; defaulting join to WV.UWI = W.UWI")
     }
   }
+
+  wl_join_condition <- "(WL.GSL_UWI = W.GSL_UWI OR WL.UWI = W.UWI)"
 
   sql_well_master_base <- paste0(
     "SELECT W.UWI, W.GSL_UWI, W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE, ",
@@ -891,7 +885,7 @@ if (load_from_db) {
     "W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE, ",
     "P.STRAT_UNIT_ID, COALESCE(WV.SPUD_DATE, W.SPUD_DATE) AS SPUD_DATE, ",
     "WD.RIG_RELEASE_DATE AS RIG_RELEASE_DATE, ",
-    "COALESCE(W.COMPLETION_DATE, WV.COMPLETION_DATE) AS COMPLETION_DATE, ",
+    "COALESCE(WV.COMPLETION_DATE, W.COMPLETION_DATE) AS COMPLETION_DATE, ",
     "COALESCE(PFS.FIRST_PROD_DATE, WV.FIRST_PROD_DATE) AS FIRST_PROD_DATE, ",
     "W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, ",
     "FL.FIELD_NAME, ",
@@ -903,7 +897,7 @@ if (load_from_db) {
     "LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI ",
     "LEFT JOIN CLIENT_VIEWS.WELL_DRILLING_V11 WD ON ", wd_join_condition, " ",
     "LEFT JOIN CLIENT_VIEWS.WELL_VERSION_V11  WV ON ", wv_join_condition, " ",
-    "LEFT JOIN CLIENT_VIEWS.WELL_LICENSE_V11 WL ON WL.UWI = W.UWI ",
+    "LEFT JOIN CLIENT_VIEWS.WELL_LICENSE_V11 WL ON ", wl_join_condition, " ",
     "WHERE W.SURFACE_LATITUDE IS NOT NULL AND W.SURFACE_LONGITUDE IS NOT NULL ",
     "AND (COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) IS NULL ",
     "     OR COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) > SYSDATE - (365*20))"
@@ -978,14 +972,13 @@ if (load_from_db) {
       message("DUC DEBUG: Rig release fallback query returned no rows; continuing with existing RigReleaseDate values.")
     }
 
-    wells_master_dt[, is_abandoned := data.table::fifelse(
-      !is.na(AbandonmentDate),
-      TRUE,
-      {
-        st <- toupper(trimws(as.character(CurrentStatus)))
-        !is.na(st) & grepl("\\bABD\\b|\\bABAND\\b|\\bABANDON\\b", st)
-      }
-    )]
+    wells_master_dt[, is_abandoned := {
+      st <- toupper(trimws(as.character(CurrentStatus)))
+      dt <- as.IDate(AbandonmentDate)
+      nz <- !is.na(dt)
+      pat <- !is.na(st) & grepl("(^|[^A-Z])ABD|ABAND|ABANDON|ABDN|ABAND'D|ABANDONED", st, perl = TRUE)
+      nz | pat
+    }]
     if (!"STRAT_UNIT_ID" %in% names(wells_master_dt)) wells_master_dt[, STRAT_UNIT_ID := NA_character_]; wells_master_dt[, STRAT_UNIT_ID := as.character(STRAT_UNIT_ID)]
     
     if ("CONFIDENTIAL_TYPE" %in% names(wells_master_dt)) {
@@ -1410,19 +1403,9 @@ ui <- fluidPage(
                            fluidRow(
                              column(4,
                                     checkboxInput(
-                                      "gor_remove_outliers",
-                                      "Exclude extreme GOR outliers (drops liquids < 5 bbl/month and caps by quantile)",
-                                      value = TRUE
-                                    )
-                             ),
-                             column(4,
-                                    numericInput(
-                                      "gor_quantile_cap",
-                                      "GOR quantile cap",
-                                      value = 0.99,
-                                      min = 0.5,
-                                      max = 1,
-                                      step = 0.01
+                                      "trim_outliers",
+                                      "Trim GOR outliers (winsorize 1st-99th percentile per group)",
+                                      value = FALSE
                                     )
                              )
                            ),
@@ -2292,6 +2275,7 @@ server <- function(input, output, session) {
       Formation,
       FieldName,
       CurrentStatus,
+      is_abandoned,
       SpudDate,
       RigReleaseDate,
       DrillDoneDate,
@@ -3849,15 +3833,27 @@ server <- function(input, output, session) {
       ts_dt[, LiquidsBBL := OilBBL + CndBBL]
     }
     ts_dt[, LiquidsForGOR := suppressWarnings(as.numeric(LiquidsBBL))]
-    if (isTRUE(input$gor_remove_outliers)) {
-      cap_prob <- suppressWarnings(as.numeric(input$gor_quantile_cap))
-      if (!is.finite(cap_prob) || cap_prob <= 0 || cap_prob > 1) cap_prob <- 0.99
+    trim_group_col <- input$gor_group_by %||% "OperatorName"
+    if (!trim_group_col %in% names(ts_dt)) {
+      ts_dt[, (trim_group_col) := NA_character_]
+    }
+    if (isTRUE(input$trim_outliers)) {
       ts_dt <- ts_dt[is.na(LiquidsForGOR) | LiquidsForGOR >= 5]
-      finite_gor <- ts_dt[is.finite(GOR_MCF_PER_BBL) & GOR_MCF_PER_BBL >= 0, GOR_MCF_PER_BBL]
-      if (length(finite_gor)) {
-        cap_val <- stats::quantile(finite_gor, probs = cap_prob, na.rm = TRUE, names = FALSE)
-        ts_dt[is.finite(GOR_MCF_PER_BBL) & GOR_MCF_PER_BBL > cap_val, GOR_MCF_PER_BBL := cap_val]
+      ts_dt[, TrimGroup := {
+        vals <- get(trim_group_col)
+        ifelse(is.na(vals) | trimws(as.character(vals)) == "", "(Unknown)", as.character(vals))
+      }]
+      trim_stats <- ts_dt[is.finite(GOR_MCF_PER_BBL) & GOR_MCF_PER_BBL >= 0,
+                          .(p1 = stats::quantile(GOR_MCF_PER_BBL, 0.01, na.rm = TRUE, names = FALSE),
+                            p99 = stats::quantile(GOR_MCF_PER_BBL, 0.99, na.rm = TRUE, names = FALSE)),
+                          by = TrimGroup]
+      if (nrow(trim_stats)) {
+        ts_dt <- merge(ts_dt, trim_stats, by = "TrimGroup", all.x = TRUE, sort = FALSE)
+        ts_dt[is.finite(GOR_MCF_PER_BBL) & !is.na(p1) & GOR_MCF_PER_BBL < p1, GOR_MCF_PER_BBL := p1]
+        ts_dt[is.finite(GOR_MCF_PER_BBL) & !is.na(p99) & GOR_MCF_PER_BBL > p99, GOR_MCF_PER_BBL := p99]
+        ts_dt[, c("p1", "p99") := NULL]
       }
+      ts_dt[, TrimGroup := NULL]
     }
     ts_dt[, CalendarMonth := lubridate::floor_date(PROD_DATE, "month")]
     ts_dt[, GasWeighting := if ("GasWeighting" %in% names(ts_dt)) GasWeighting else NA_real_]
@@ -4445,17 +4441,19 @@ server <- function(input, output, session) {
     shutin_pool[ProvinceState %in% c("SASK", "SASKATCHEWAN", "SK.", "SK "), ProvinceState := "SK"]
     shutin_pool[, ProvinceState := trimws(ProvinceState)]
 
-    shutin_pool[, CurrentStatus := as.character(CurrentStatus)]
-    shutin_pool[, is_abandoned_snapshot := data.table::fifelse(
-      !is.na(AbandonmentDate) & AbandonmentDate <= snapshot_date,
-      TRUE,
-      {
+    if (!"is_abandoned" %in% names(shutin_pool)) {
+      shutin_pool[, CurrentStatus := as.character(CurrentStatus)]
+      shutin_pool[, is_abandoned := {
         st <- toupper(trimws(CurrentStatus))
-        !is.na(st) & grepl("\\bABD\\b|\\bABAND\\b|\\bABANDON\\b", st)
-      }
-    )]
-    shutin_pool <- shutin_pool[is.na(is_abandoned_snapshot) | is_abandoned_snapshot == FALSE]
-    shutin_pool[, is_abandoned_snapshot := NULL]
+        dt <- as.IDate(AbandonmentDate)
+        nz <- !is.na(dt) & dt <= snapshot_date
+        pat <- !is.na(st) & grepl("(^|[^A-Z])ABD|ABAND|ABANDON|ABDN|ABAND'D|ABANDONED", st, perl = TRUE)
+        nz | pat
+      }]
+    }
+    if (!"is_abandoned" %in% names(shutin_pool)) shutin_pool[, is_abandoned := FALSE]
+    shutin_pool[is.na(is_abandoned), is_abandoned := FALSE]
+    shutin_pool <- shutin_pool[is_abandoned == FALSE]
 
     message("SHUTIN DEBUG: unique ProvinceState in shut-in candidate pool:")
     print(sort(unique(shutin_pool$ProvinceState)))
@@ -4631,7 +4629,8 @@ server <- function(input, output, session) {
       NoProductionMonthsThreshold = no_prod_months,
       RecentActivityWindowMonths = recent_window_mo,
       AbandonmentDate = as.Date(AbandonmentDate),
-      CurrentStatus
+      CurrentStatus,
+      is_abandoned
     )]
 
     reactive_vals$shutin_summary <- shutin_summary
