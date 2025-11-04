@@ -876,6 +876,8 @@ if (load_from_db) {
   }
 
   wl_join_condition <- "(WL.GSL_UWI = W.GSL_UWI OR WL.UWI = W.UWI)"
+  wc_join_condition <- "(WC.GSL_UWI = W.GSL_UWI OR WC.UWI = W.UWI)"
+  wf_join_condition <- "(WF.GSL_UWI = W.GSL_UWI OR WF.UWI = W.UWI)"
 
   sql_well_master_base <- paste0(
     "SELECT W.UWI, W.GSL_UWI, W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE, ",
@@ -885,12 +887,17 @@ if (load_from_db) {
     "W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE, ",
     "P.STRAT_UNIT_ID, COALESCE(WV.SPUD_DATE, W.SPUD_DATE) AS SPUD_DATE, ",
     "WD.RIG_RELEASE_DATE AS RIG_RELEASE_DATE, ",
-    "COALESCE(WV.COMPLETION_DATE, W.COMPLETION_DATE) AS COMPLETION_DATE, ",
     "COALESCE(PFS.FIRST_PROD_DATE, WV.FIRST_PROD_DATE) AS FIRST_PROD_DATE, ",
     "W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, ",
     "FL.FIELD_NAME, ",
     "COALESCE(WL.GSL_LICENSE_SUBSTANCE, W.LICENSED_SUBSTANCE) AS LICENSED_SUBSTANCE, ",
-    "WV.LAHEE, WV.LAHEE_CLASS, WV.LAHEE_CLASSIFICATION ",
+    "WV.LAHEE, WV.LAHEE_CLASS, WV.LAHEE_CLASSIFICATION, ",
+    "W.COMPLETION_DATE AS COMPLETION_DATE_WELL, ",
+    "WV.COMPLETION_DATE AS COMPLETION_DATE_WV, ",
+    "WC.COMPLETION_DATE AS COMPLETION_DATE_WC, ",
+    "WF.COMPLETION_END_DATE AS COMPLETION_END_DATE_WF, ",
+    "WF.COMPLETION_START_DATE AS COMPLETION_START_DATE_WF, ",
+    "COALESCE(WV.COMPLETION_DATE, W.COMPLETION_DATE) AS COMPLETION_DATE_BASE ",
     "FROM WELL W ",
     "LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI ",
     "LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID ",
@@ -898,6 +905,8 @@ if (load_from_db) {
     "LEFT JOIN CLIENT_VIEWS.WELL_DRILLING_V11 WD ON ", wd_join_condition, " ",
     "LEFT JOIN CLIENT_VIEWS.WELL_VERSION_V11  WV ON ", wv_join_condition, " ",
     "LEFT JOIN CLIENT_VIEWS.WELL_LICENSE_V11 WL ON ", wl_join_condition, " ",
+    "LEFT JOIN CLIENT_VIEWS.WELL_COMPLETION_V11 WC ON ", wc_join_condition, " ",
+    "LEFT JOIN CLIENT_VIEWS.GSL_WELL_FRAC_V11 WF ON ", wf_join_condition, " ",
     "WHERE W.SURFACE_LATITUDE IS NOT NULL AND W.SURFACE_LONGITUDE IS NOT NULL ",
     "AND (COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) IS NULL ",
     "     OR COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) > SYSDATE - (365*20))"
@@ -908,7 +917,12 @@ if (load_from_db) {
     message(paste("DB Load: Successfully loaded", nrow(wells_master_df_raw), "base well rows from DB.")); wells_master_dt <- data.table::as.data.table(wells_master_df_raw)
     setnames(wells_master_dt, "FIELD_NAME", "FieldName", skip_absent = TRUE)
     setnames(wells_master_dt, "LICENSED_SUBSTANCE", "LicensedSubstance", skip_absent = TRUE)
-    setnames(wells_master_dt, "COMPLETION_DATE", "CompletionDate", skip_absent = TRUE)
+    setnames(wells_master_dt, "COMPLETION_DATE_WELL", "CompletionDate_Well", skip_absent = TRUE)
+    setnames(wells_master_dt, "COMPLETION_DATE_WV", "CompletionDate_WV", skip_absent = TRUE)
+    setnames(wells_master_dt, "COMPLETION_DATE_WC", "CompletionDate_WC", skip_absent = TRUE)
+    setnames(wells_master_dt, "COMPLETION_END_DATE_WF", "CompletionEndDate_WF", skip_absent = TRUE)
+    setnames(wells_master_dt, "COMPLETION_START_DATE_WF", "CompletionStartDate_WF", skip_absent = TRUE)
+    setnames(wells_master_dt, "COMPLETION_DATE_BASE", "CompletionDateBase", skip_absent = TRUE)
     setnames(wells_master_dt, "CURRENT_STATUS", "CurrentStatus", skip_absent = TRUE)
     setnames(wells_master_dt, "LAHEE", "Lahee", skip_absent = TRUE)
     setnames(wells_master_dt, "LAHEE_CLASS", "LaheeClass", skip_absent = TRUE)
@@ -921,11 +935,25 @@ if (load_from_db) {
     if("GSL_UWI" %in% names(wells_master_dt)) wells_master_dt[, GSL_UWI := norm_uwi(GSL_UWI)]
     if("UWI" %in% names(wells_master_dt)) wells_master_dt[, UWI_Std := standardize_uwi(UWI)] else wells_master_dt[, UWI_Std := NA_character_]
     if("GSL_UWI" %in% names(wells_master_dt)) wells_master_dt[, GSL_UWI_Std := standardize_uwi(GSL_UWI)] else wells_master_dt[, GSL_UWI_Std := NA_character_]
-    date_cols_master <- intersect(c("SpudDate", "RigReleaseDate", "CompletionDate", "FirstProdDate", "AbandonmentDate"), names(wells_master_dt))
+    date_cols_master <- intersect(c("SpudDate", "RigReleaseDate", "CompletionDate", "CompletionDateBase", "CompletionDate_Well", "CompletionDate_WV", "CompletionDate_WC", "CompletionEndDate_WF", "CompletionStartDate_WF", "FirstProdDate", "AbandonmentDate"), names(wells_master_dt))
     for (dc in date_cols_master) wells_master_dt[, (dc) := as.IDate(get(dc))]
+    completion_sources <- intersect(c("CompletionDate", "CompletionDateBase", "CompletionDate_Well", "CompletionDate_WV", "CompletionDate_WC", "CompletionEndDate_WF", "CompletionStartDate_WF"), names(wells_master_dt))
+    if (length(completion_sources)) {
+      comp_mat <- do.call(cbind, lapply(completion_sources, function(col) as.integer(wells_master_dt[[col]])))
+      if (is.matrix(comp_mat)) {
+        max_vals <- apply(comp_mat, 1, function(row) {
+          row <- row[!is.na(row)]
+          if (length(row) == 0) NA_integer_ else max(row)
+        })
+        wells_master_dt[, CompletionDate := as.IDate(as.integer(max_vals))]
+      } else {
+        wells_master_dt[, CompletionDate := as.IDate(NA)]
+      }
+    } else if (!"CompletionDate" %in% names(wells_master_dt)) {
+      wells_master_dt[, CompletionDate := as.IDate(NA)]
+    }
     if (!"FieldName" %in% names(wells_master_dt)) wells_master_dt[, FieldName := NA_character_]
     if (!"LicensedSubstance" %in% names(wells_master_dt)) wells_master_dt[, LicensedSubstance := NA_character_]
-    if (!"CompletionDate" %in% names(wells_master_dt)) wells_master_dt[, CompletionDate := as.IDate(NA)]
     if (!"CurrentStatus" %in% names(wells_master_dt)) wells_master_dt[, CurrentStatus := NA_character_]
     if (!"Lahee" %in% names(wells_master_dt)) wells_master_dt[, Lahee := NA_character_]
     if (!"LaheeClass" %in% names(wells_master_dt)) wells_master_dt[, LaheeClass := NA_character_]
@@ -1035,6 +1063,9 @@ if (load_from_db) {
       "OPERATOR_CODE"="OperatorCode", "STRAT_UNIT_ID"="StratUnitID",
       "SPUD_DATE"="SpudDate", "RIG_RELEASE_DATE"="RigReleaseDate", "FIRST_PROD_DATE"="FirstProdDate",
       "FINAL_TD"="FinalTD", "PROVINCE_STATE"="ProvinceState", "COUNTRY"="Country",
+      "COMPLETION_DATE_BASE"="CompletionDateBase", "COMPLETION_DATE_WELL"="CompletionDate_Well",
+      "COMPLETION_DATE_WV"="CompletionDate_WV", "COMPLETION_DATE_WC"="CompletionDate_WC",
+      "COMPLETION_END_DATE_WF"="CompletionEndDate_WF", "COMPLETION_START_DATE_WF"="CompletionStartDate_WF",
       "UWI_Std"="UWI_Std", "GSL_UWI_Std"="GSL_UWI_Std",
       "OperatorNameDisplay"="OperatorName", "Formation"="Formation", "FieldName"="FieldName",
       "CONFIDENTIAL_TYPE"="ConfidentialType", "LICENSED_SUBSTANCE"="LicensedSubstance",
