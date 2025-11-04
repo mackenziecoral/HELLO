@@ -342,12 +342,12 @@ fetch_pden_chunk <- function(con, gsl_ids, year_from, year_to) {
     DBI::dbGetQuery(con, sql, params = cte_info$params) |> data.table::as.data.table()
   }, error = function(e) {
     message("SHUTIN DEBUG: fetch_pden_chunk error: ", e$message)
-    stop(e)
+    data.table::data.table()
   })
 }
 
 batch_fetch_pden <- function(con, ids, year_from, year_to,
-                             start_chunk = 200L, min_chunk = 25L, retry = 1L) {
+                             start_chunk = 150L, min_chunk = 10L, retry = 2L) {
   ids <- unique(trimws(as.character(ids)))
   ids <- ids[!is.na(ids) & ids != ""]
   if (!length(ids)) return(list(data = data.table::data.table(), partial = FALSE))
@@ -366,19 +366,27 @@ batch_fetch_pden <- function(con, ids, year_from, year_to,
       i, j, length(ids_slice), ids_slice[1], ids_slice[length(ids_slice)]
     ))
     ok <- TRUE
-    res <- NULL
+    res <- data.table::data.table()
     tryCatch({
       res <- fetch_pden_chunk(con, ids_slice, year_from, year_to)
+      if (nrow(res) == 0L) {
+        partial <- TRUE
+      }
     }, error = function(e) {
       ok <<- FALSE
       message(sprintf("SHUTIN DEBUG: chunk error: %s", conditionMessage(e)))
     })
 
-    if (ok) {
+    if (ok && nrow(res) > 0L) {
       out[[length(out) + 1L]] <- res
       i <- j + 1L
       if (chunk < 250L) chunk <- chunk + 25L
     } else {
+      if (ok && nrow(res) == 0L) {
+        partial <- TRUE
+        i <- j + 1L
+        next
+      }
       if (chunk > min_chunk) {
         chunk <- max(min_chunk, chunk %/% 2L)
         next
@@ -445,6 +453,10 @@ infer_first_prod_date <- function(monthly_dt, threshold_boe = 3, mcf_per_boe = M
     return(data.table::data.table(GSL_UWI = character(), FirstProdDateInferred = as.Date(character())))
   }
   dt[, .(FirstProdDateInferred = min(PROD_DATE, na.rm = TRUE)), by = GSL_UWI]
+}
+
+is_zeroish <- function(boe, tol = 1.0) {
+  !is.na(boe) & boe <= tol
 }
 
 # --- 1. Define File Paths and Constants ---
@@ -875,19 +887,26 @@ if (load_from_db) {
     "SELECT W.UWI, W.GSL_UWI, W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE, ",
     "W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE, W.GSL_FULL_LATERAL_LENGTH, ",
     "COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) AS ABANDONMENT_DATE, W.WELL_NAME, ",
-    "COALESCE(WV.CURRENT_STATUS, W.CURRENT_STATUS) AS CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE, ",
-    "P.STRAT_UNIT_ID, COALESCE(WV.SPUD_DATE, W.SPUD_DATE) AS SPUD_DATE, WD.RIG_RELEASE_DATE AS RIG_RELEASE_DATE, ",
+    "COALESCE(WV.CURRENT_STATUS, W.CURRENT_STATUS) AS CURRENT_STATUS, ",
+    "W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE, ",
+    "P.STRAT_UNIT_ID, COALESCE(WV.SPUD_DATE, W.SPUD_DATE) AS SPUD_DATE, ",
+    "WD.RIG_RELEASE_DATE AS RIG_RELEASE_DATE, ",
+    "COALESCE(W.COMPLETION_DATE, WV.COMPLETION_DATE) AS COMPLETION_DATE, ",
     "COALESCE(PFS.FIRST_PROD_DATE, WV.FIRST_PROD_DATE) AS FIRST_PROD_DATE, ",
-    "COALESCE(WV.COMPLETION_DATE, W.COMPLETION_DATE) AS COMPLETION_DATE, W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, ",
-    "FL.FIELD_NAME, W.LICENSED_SUBSTANCE, WV.LAHEE, WV.LAHEE_CLASS, WV.LAHEE_CLASSIFICATION ",
+    "W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, ",
+    "FL.FIELD_NAME, ",
+    "COALESCE(WL.GSL_LICENSE_SUBSTANCE, W.LICENSED_SUBSTANCE) AS LICENSED_SUBSTANCE, ",
+    "WV.LAHEE, WV.LAHEE_CLASS, WV.LAHEE_CLASSIFICATION ",
     "FROM WELL W ",
     "LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI ",
     "LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID ",
     "LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI ",
     "LEFT JOIN CLIENT_VIEWS.WELL_DRILLING_V11 WD ON ", wd_join_condition, " ",
-    "LEFT JOIN CLIENT_VIEWS.WELL_VERSION_V11 WV ON ", wv_join_condition, " ",
+    "LEFT JOIN CLIENT_VIEWS.WELL_VERSION_V11  WV ON ", wv_join_condition, " ",
+    "LEFT JOIN CLIENT_VIEWS.WELL_LICENSE_V11 WL ON WL.UWI = W.UWI ",
     "WHERE W.SURFACE_LATITUDE IS NOT NULL AND W.SURFACE_LONGITUDE IS NOT NULL ",
-    "AND (COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) IS NULL OR COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) > SYSDATE - (365*20))"
+    "AND (COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) IS NULL ",
+    "     OR COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) > SYSDATE - (365*20))"
   )
   message("Fetching well master data from Oracle..."); wells_master_df_raw <- tryCatch({ dbGetQuery(con, sql_well_master_base) }, error = function(e) { warning(paste("Error fetching well master data from Oracle:", e$message)); data.frame() })
   wells_master_dt <- data.table::data.table()
@@ -918,9 +937,16 @@ if (load_from_db) {
     if (!"LaheeClass" %in% names(wells_master_dt)) wells_master_dt[, LaheeClass := NA_character_]
     if (!"LaheeClassification" %in% names(wells_master_dt)) wells_master_dt[, LaheeClassification := NA_character_]
 
-    wells_master_dt[, LaheeUnified := toupper(trimws(
-      col_or_const(wells_master_dt, c("Lahee", "LaheeClass", "LaheeClassification"))
-    ))]
+    wells_master_dt[, LaheeUnified := toupper(trimws(data.table::fifelse(
+      !is.na(Lahee) & Lahee != "", Lahee,
+      data.table::fifelse(
+        !is.na(LaheeClassification) & LaheeClassification != "", LaheeClassification,
+        data.table::fifelse(
+          !is.na(LaheeClass) & LaheeClass != "", LaheeClass,
+          NA_character_
+        )
+      )
+    )))]
 
     rig_release_fallback_df <- tryCatch({
       DBI::dbGetQuery(
@@ -951,6 +977,15 @@ if (load_from_db) {
     } else {
       message("DUC DEBUG: Rig release fallback query returned no rows; continuing with existing RigReleaseDate values.")
     }
+
+    wells_master_dt[, is_abandoned := data.table::fifelse(
+      !is.na(AbandonmentDate),
+      TRUE,
+      {
+        st <- toupper(trimws(as.character(CurrentStatus)))
+        !is.na(st) & grepl("\\bABD\\b|\\bABAND\\b|\\bABANDON\\b", st)
+      }
+    )]
     if (!"STRAT_UNIT_ID" %in% names(wells_master_dt)) wells_master_dt[, STRAT_UNIT_ID := NA_character_]; wells_master_dt[, STRAT_UNIT_ID := as.character(STRAT_UNIT_ID)]
     
     if ("CONFIDENTIAL_TYPE" %in% names(wells_master_dt)) {
@@ -1375,8 +1410,8 @@ ui <- fluidPage(
                            fluidRow(
                              column(4,
                                     checkboxInput(
-                                      "gor_exclude_outliers",
-                                      "Exclude GOR outliers (apply quantile cap)",
+                                      "gor_remove_outliers",
+                                      "Exclude extreme GOR outliers (drops liquids < 5 bbl/month and caps by quantile)",
                                       value = TRUE
                                     )
                              ),
@@ -2300,6 +2335,8 @@ server <- function(input, output, session) {
       if (!col %in% names(dt)) dt[, (col) := as.Date(NA)]
       dt[, (col) := as.Date(get(col))]
     }
+    if (!"is_abandoned" %in% names(dt)) dt[, is_abandoned := FALSE]
+    dt[is.na(is_abandoned), is_abandoned := FALSE]
 
     lahee_vals_dt <- col_or_const(dt, c("LaheeUnified", "Lahee", "LaheeClass", "LaheeClassification"))
     dt[, LaheeUnified := toupper(trimws(as.character(lahee_vals_dt)))]
@@ -2329,8 +2366,9 @@ server <- function(input, output, session) {
       20
     ))
 
-    filtered_dt[, LicensedSubstance := toupper(trimws(col_or_const(filtered_dt, c("LicensedSubstance", "LICENSED_SUBSTANCE"))))]
-    filtered_dt[is.na(LicensedSubstance) | LicensedSubstance == "", LicensedSubstance := "UNKNOWN"]
+    licensed_vals <- col_or_const(filtered_dt, c("LicensedSubstance", "LICENSED_SUBSTANCE"))
+    filtered_dt[, LicensedSubstance := trimws(as.character(licensed_vals))]
+    filtered_dt[LicensedSubstance == "", LicensedSubstance := NA_character_]
 
     lahee_vals <- col_or_const(filtered_dt, c("LaheeUnified", "Lahee", "LaheeClass", "LaheeClassification"))
     filtered_dt[, LaheeUnified := toupper(trimws(as.character(lahee_vals)))]
@@ -2376,18 +2414,7 @@ server <- function(input, output, session) {
       }
     }
 
-    choices <- sort(unique(filtered_dt$LicensedSubstance))
-    reactive_vals$duc_substance_choices <- choices
-
-    if (!is.null(input$duc_substance_filter) && length(input$duc_substance_filter) > 0) {
-      keep_vals <- input$duc_substance_filter
-      if (isTRUE(input$duc_include_unknown_substance)) {
-        keep_vals <- union(keep_vals, "UNKNOWN")
-      }
-      filtered_dt <- filtered_dt[LicensedSubstance %in% keep_vals]
-    } else if (!isTRUE(input$duc_include_unknown_substance)) {
-      filtered_dt <- filtered_dt[LicensedSubstance != "UNKNOWN"]
-    }
+    reactive_vals$duc_substance_choices <- sort(unique(filtered_dt$LicensedSubstance))
 
     filtered_dt[, .(
       UWI,
@@ -3822,10 +3849,10 @@ server <- function(input, output, session) {
       ts_dt[, LiquidsBBL := OilBBL + CndBBL]
     }
     ts_dt[, LiquidsForGOR := suppressWarnings(as.numeric(LiquidsBBL))]
-    if (isTRUE(input$gor_exclude_outliers)) {
+    if (isTRUE(input$gor_remove_outliers)) {
       cap_prob <- suppressWarnings(as.numeric(input$gor_quantile_cap))
       if (!is.finite(cap_prob) || cap_prob <= 0 || cap_prob > 1) cap_prob <- 0.99
-      ts_dt <- ts_dt[is.na(LiquidsForGOR) | LiquidsForGOR >= 0.5]
+      ts_dt <- ts_dt[is.na(LiquidsForGOR) | LiquidsForGOR >= 5]
       finite_gor <- ts_dt[is.finite(GOR_MCF_PER_BBL) & GOR_MCF_PER_BBL >= 0, GOR_MCF_PER_BBL]
       if (length(finite_gor)) {
         cap_val <- stats::quantile(finite_gor, probs = cap_prob, na.rm = TRUE, names = FALSE)
@@ -4020,6 +4047,9 @@ server <- function(input, output, session) {
     }
 
     duc_pool <- data.table::copy(candidate)
+    if (!"is_abandoned" %in% names(duc_pool)) duc_pool[, is_abandoned := FALSE]
+    duc_pool[is.na(is_abandoned), is_abandoned := FALSE]
+    duc_pool <- duc_pool[is_abandoned == FALSE]
     duc_pool[, ProvinceState := toupper(trimws(ProvinceState))]
     duc_pool[ProvinceState %in% c("B.C.", "BC.", "B C", "BRITISH COLUMBIA", "B.C", "B C."), ProvinceState := "BC"]
     duc_pool[ProvinceState %in% c("ALBERTA", "ALTA", "AB.", "AB "), ProvinceState := "AB"]
@@ -4416,11 +4446,16 @@ server <- function(input, output, session) {
     shutin_pool[, ProvinceState := trimws(ProvinceState)]
 
     shutin_pool[, CurrentStatus := as.character(CurrentStatus)]
-    shutin_pool[, CurrentStatusNorm := tolower(trimws(CurrentStatus))]
-    shutin_pool[, is_abandoned := (!is.na(AbandonmentDate) & AbandonmentDate <= snapshot_date) |
-                                  (!is.na(CurrentStatusNorm) & grepl("abd|aband", CurrentStatusNorm, perl = TRUE))]
-    shutin_pool <- shutin_pool[!is_abandoned]
-    shutin_pool[, c("CurrentStatusNorm", "is_abandoned") := NULL]
+    shutin_pool[, is_abandoned_snapshot := data.table::fifelse(
+      !is.na(AbandonmentDate) & AbandonmentDate <= snapshot_date,
+      TRUE,
+      {
+        st <- toupper(trimws(CurrentStatus))
+        !is.na(st) & grepl("\\bABD\\b|\\bABAND\\b|\\bABANDON\\b", st)
+      }
+    )]
+    shutin_pool <- shutin_pool[is.na(is_abandoned_snapshot) | is_abandoned_snapshot == FALSE]
+    shutin_pool[, is_abandoned_snapshot := NULL]
 
     message("SHUTIN DEBUG: unique ProvinceState in shut-in candidate pool:")
     print(sort(unique(shutin_pool$ProvinceState)))
@@ -4495,38 +4530,40 @@ server <- function(input, output, session) {
     monthly_totals <- monthly_totals[PROD_DATE <= month_end]
     monthly_totals[, TotalBOE := (OilBBL + CndBBL) + (GasMCF / MCF_PER_BOE)]
     monthly_totals[is.na(TotalBOE), TotalBOE := 0]
+    monthly_totals[, Zeroish := is_zeroish(TotalBOE, tol = residual_threshold)]
 
     first_inferred <- infer_first_prod_date(monthly_totals, residual_threshold, MCF_PER_BOE)
-    last_prod_month <- monthly_totals[TotalBOE > residual_threshold & PROD_DATE <= month_end,
+    last_prod_month <- monthly_totals[Zeroish == FALSE & PROD_DATE <= month_end,
                                       .(LastProdMonth = max(PROD_DATE)), by = GSL_UWI]
 
     if (length(window_months_all)) {
       window_grid <- data.table::CJ(GSL_UWI = unique(valid_ids), PROD_DATE = window_months_all, unique = TRUE)
       window_grid <- merge(
         window_grid,
-        monthly_totals[, .(GSL_UWI, PROD_DATE, TotalBOE)],
+        monthly_totals[, .(GSL_UWI, PROD_DATE, TotalBOE, Zeroish)],
         by = c("GSL_UWI", "PROD_DATE"),
         all.x = TRUE,
         sort = FALSE
       )
       window_grid[is.na(TotalBOE), TotalBOE := 0]
+      window_grid[is.na(Zeroish), Zeroish := is_zeroish(TotalBOE, tol = residual_threshold)]
     } else {
-      window_grid <- data.table::data.table(GSL_UWI = unique(valid_ids), PROD_DATE = as.Date(character()), TotalBOE = numeric())
+      window_grid <- data.table::data.table(GSL_UWI = unique(valid_ids), PROD_DATE = as.Date(character()), TotalBOE = numeric(), Zeroish = logical())
     }
 
     if (recent_window_mo > 0) {
       recent_flag <- window_grid[PROD_DATE %in% recent_months,
-                                 .(had_recent_prod = any(TotalBOE > residual_threshold, na.rm = TRUE)),
+                                 .(had_recent_prod = any(!Zeroish, na.rm = TRUE)),
                                  by = GSL_UWI]
     } else {
       recent_flag <- data.table::data.table(GSL_UWI = unique(valid_ids), had_recent_prod = TRUE)
     }
 
     silent_flag <- window_grid[PROD_DATE %in% silent_months,
-                               .(had_silent_prod = any(TotalBOE > residual_threshold, na.rm = TRUE)),
+                               .(SilentAllZero = all(Zeroish, na.rm = TRUE)),
                                by = GSL_UWI]
     if (!nrow(silent_flag)) {
-      silent_flag <- data.table::data.table(GSL_UWI = unique(valid_ids), had_silent_prod = FALSE)
+      silent_flag <- data.table::data.table(GSL_UWI = unique(valid_ids), SilentAllZero = FALSE)
     }
 
     shutin <- merge(shutin_pool, first_inferred, by = "GSL_UWI", all.x = TRUE)
@@ -4535,7 +4572,7 @@ server <- function(input, output, session) {
     shutin <- merge(shutin, silent_flag, by = "GSL_UWI", all.x = TRUE)
 
     shutin[is.na(had_recent_prod), had_recent_prod := (recent_window_mo == 0)]
-    shutin[is.na(had_silent_prod), had_silent_prod := FALSE]
+    shutin[is.na(SilentAllZero), SilentAllZero := FALSE]
 
     shutin[, FirstProdDate := as.Date(FirstProdDate)]
     shutin[, AbandonmentDate := as.Date(AbandonmentDate)]
@@ -4556,7 +4593,7 @@ server <- function(input, output, session) {
       HasProductionHistory &
         (is.na(AbandonmentDate) | AbandonmentDate > snapshot_date) &
         had_recent_prod &
-        !had_silent_prod
+        SilentAllZero
     ]
 
     message("SHUTIN DEBUG: counts by ProvinceState after rules:")
