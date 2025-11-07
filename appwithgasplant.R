@@ -27,6 +27,29 @@ library(plotly)
 # ==== Gas Plant: constants & helpers ====
 `%||%` <- function(x, y) { if (is.null(x) || length(x) == 0) return(y); x }
 
+safe_col <- function(DT, candidates) {
+  if (is.null(DT)) return(NULL)
+  nms <- names(DT)
+  picks <- candidates[candidates %in% nms]
+  if (length(picks)) picks[1] else NULL
+}
+
+col_or_const <- function(DT, candidates, default = NA_character_) {
+  nm <- safe_col(DT, candidates)
+  if (is.null(nm)) {
+    len <- if (is.null(DT)) 0L else nrow(DT)
+    return(rep_len(default, len))
+  }
+  DT[[nm]]
+}
+
+norm_uwi <- function(x) {
+  if (is.null(x)) return(character(0))
+  x_chr <- as.character(x)
+  x_chr <- gsub("[^A-Za-z0-9]", "", x_chr)
+  toupper(x_chr)
+}
+
 resolve_existing_dir <- function(candidates, fallback = ".") {
   candidates <- unique(trimws(candidates))
   candidates <- candidates[!is.na(candidates) & candidates != ""]
@@ -35,6 +58,7 @@ resolve_existing_dir <- function(candidates, fallback = ".") {
                                error = function(e) cand)
     if (dir.exists(candidate_path)) return(candidate_path)
   }
+
   tryCatch(normalizePath(fallback, winslash = "/", mustWork = FALSE), error = function(e) fallback)
 }
 
@@ -151,6 +175,20 @@ normalize_operator_label <- function(x) {
   out
 }
 
+util_palette <- function(x) {
+  leaflet::colorBin(
+    "viridis",
+    domain = x,
+    bins = c(0, 0.5, 0.7, 0.85, 1.0, 1.2, Inf),
+    right = FALSE,
+    na.color = "#cccccc"
+  )
+}
+
+op_palette <- function(op_levels) {
+  leaflet::colorFactor(palette = custom_palette, domain = op_levels, na.color = "#999999")
+}
+
 normalize_type_label <- function(x) {
   out <- trimws(as.character(x))
   out[is.na(out) | out == ""] <- "(Unknown)"
@@ -258,6 +296,172 @@ onStop(function() {
     message("Disconnected from Oracle database on app stop.")
   }
 })
+
+# --- Production query helpers for chunked shut-in pulls ---
+chunk_vec <- function(x, n = 900L) {
+  if (length(x) == 0) return(list())
+  split(x, ceiling(seq_along(x) / n))
+}
+
+build_ids_cte <- function(ids, con) {
+  ids <- unique(trimws(as.character(ids)))
+  ids <- ids[!is.na(ids) & ids != ""]
+  if (!length(ids)) return(list(sql = "", params = list()))
+
+  placeholders <- sprintf(":u%d", seq_along(ids))
+  cte_body <- paste0(
+    paste(
+      sprintf("SELECT %s AS u FROM dual", placeholders),
+      collapse = "\nUNION ALL\n"
+    )
+  )
+  list(sql = paste0("WITH ids(u) AS (\n", cte_body, "\n)"), params = stats::setNames(as.list(ids), substr(placeholders, 2, nchar(placeholders))))
+}
+
+fetch_pden_chunk <- function(con, gsl_ids, year_from, year_to) {
+  gsl_ids <- unique(trimws(as.character(gsl_ids)))
+  gsl_ids <- gsl_ids[!is.na(gsl_ids) & gsl_ids != ""]
+  if (!length(gsl_ids)) return(data.table::data.table())
+
+  cte_info <- build_ids_cte(gsl_ids, con)
+  if (!nzchar(cte_info$sql)) return(data.table::data.table())
+
+  sql <- glue::glue_sql(
+    "{DBI::SQL(cte_info$sql)}\n",
+    "SELECT p.GSL_UWI, p.YEAR, p.PRODUCT_TYPE,\n",
+    "       p.JAN_VOLUME, p.FEB_VOLUME, p.MAR_VOLUME, p.APR_VOLUME, p.MAY_VOLUME, p.JUN_VOLUME,\n",
+    "       p.JUL_VOLUME, p.AUG_VOLUME, p.SEP_VOLUME, p.OCT_VOLUME, p.NOV_VOLUME, p.DEC_VOLUME\n",
+    "  FROM PDEN_VOL_BY_MONTH p\n",
+    "  JOIN ids ON ids.u = p.GSL_UWI\n",
+    " WHERE p.YEAR BETWEEN {year_from} AND {year_to}\n",
+    "   AND p.PRODUCT_TYPE IN ('OIL','CND','GAS')\n",
+    .con = con
+  )
+
+  tryCatch({
+    DBI::dbGetQuery(con, sql, params = cte_info$params) |> data.table::as.data.table()
+  }, error = function(e) {
+    message("SHUTIN DEBUG: fetch_pden_chunk error: ", e$message)
+    data.table::data.table()
+  })
+}
+
+batch_fetch_pden <- function(con, ids, year_from, year_to,
+                             start_chunk = 150L, min_chunk = 10L, retry = 2L) {
+  ids <- unique(trimws(as.character(ids)))
+  ids <- ids[!is.na(ids) & ids != ""]
+  if (!length(ids)) return(list(data = data.table::data.table(), partial = FALSE))
+
+  n <- length(ids)
+  chunk <- start_chunk
+  i <- 1L
+  out <- list()
+  partial <- FALSE
+
+  while (i <= n) {
+    j <- min(i + chunk - 1L, n)
+    ids_slice <- ids[i:j]
+    message(sprintf(
+      "SHUTIN DEBUG: try chunk i=%d..%d size=%d first=%s last=%s",
+      i, j, length(ids_slice), ids_slice[1], ids_slice[length(ids_slice)]
+    ))
+    ok <- TRUE
+    res <- data.table::data.table()
+    tryCatch({
+      res <- fetch_pden_chunk(con, ids_slice, year_from, year_to)
+      if (nrow(res) == 0L) {
+        partial <- TRUE
+      }
+    }, error = function(e) {
+      ok <<- FALSE
+      message(sprintf("SHUTIN DEBUG: chunk error: %s", conditionMessage(e)))
+    })
+
+    if (ok && nrow(res) > 0L) {
+      out[[length(out) + 1L]] <- res
+      i <- j + 1L
+      if (chunk < 250L) chunk <- chunk + 25L
+    } else {
+      if (ok && nrow(res) == 0L) {
+        partial <- TRUE
+        i <- j + 1L
+        next
+      }
+      if (chunk > min_chunk) {
+        chunk <- max(min_chunk, chunk %/% 2L)
+        next
+      }
+      if (retry > 0L) {
+        retry <- retry - 1L
+        next
+      }
+      message("SHUTIN DEBUG: dropping failed slice and continuing")
+      partial <- TRUE
+      i <- j + 1L
+    }
+  }
+
+  data_tbl <- if (length(out)) data.table::rbindlist(out, use.names = TRUE, fill = TRUE) else data.table::data.table()
+  list(data = data_tbl, partial = partial)
+}
+
+reshape_pden_monthlies <- function(pden_dt) {
+  if (is.null(pden_dt) || !nrow(pden_dt)) return(data.table::data.table())
+
+  month_cols <- c(
+    "JAN_VOLUME", "FEB_VOLUME", "MAR_VOLUME", "APR_VOLUME", "MAY_VOLUME", "JUN_VOLUME",
+    "JUL_VOLUME", "AUG_VOLUME", "SEP_VOLUME", "OCT_VOLUME", "NOV_VOLUME", "DEC_VOLUME"
+  )
+
+  missing_cols <- setdiff(month_cols, names(pden_dt))
+  for (col in missing_cols) pden_dt[, (col) := 0]
+
+  long_dt <- data.table::melt(
+    pden_dt,
+    id.vars = c("GSL_UWI", "YEAR", "PRODUCT_TYPE"),
+    measure.vars = month_cols,
+    variable.name = "MONTH_NAME",
+    value.name = "VOLUME"
+  )
+
+  month_map <- setNames(1:12, month_cols)
+  long_dt[, MONTH_NUM := month_map[MONTH_NAME]]
+  long_dt[, PROD_DATE := as.Date(sprintf("%04d-%02d-01", YEAR, MONTH_NUM))]
+  long_dt[, PRODUCT_TYPE := toupper(as.character(PRODUCT_TYPE))]
+  long_dt[is.na(VOLUME), VOLUME := 0]
+  long_dt[, VOLUME := as.numeric(VOLUME)]
+  long_dt[is.na(PROD_DATE), PROD_DATE := as.Date(NA)]
+  long_dt <- long_dt[!is.na(PROD_DATE)]
+
+  out <- long_dt[, .(
+    OilBBL = sum(ifelse(PRODUCT_TYPE == "OIL", VOLUME, 0), na.rm = TRUE),
+    CndBBL = sum(ifelse(PRODUCT_TYPE == "CND", VOLUME, 0), na.rm = TRUE),
+    GasMCF = sum(ifelse(PRODUCT_TYPE == "GAS", VOLUME, 0), na.rm = TRUE)
+  ), by = .(GSL_UWI, PROD_DATE)]
+
+  if (!nrow(out)) return(out)
+  for (col in c("OilBBL", "CndBBL", "GasMCF")) out[is.na(get(col)), (col) := 0]
+  out
+}
+
+infer_first_prod_date <- function(monthly_dt, threshold_boe = 3, mcf_per_boe = MCF_PER_BOE) {
+  if (is.null(monthly_dt) || !nrow(monthly_dt)) {
+    return(data.table::data.table(GSL_UWI = character(), FirstProdDateInferred = as.Date(character())))
+  }
+
+  dt <- data.table::copy(monthly_dt)
+  dt[, TotalBOE := (OilBBL + CndBBL) + (GasMCF / mcf_per_boe)]
+  dt <- dt[is.finite(TotalBOE)]
+  dt <- dt[TotalBOE > threshold_boe]
+  if (!nrow(dt)) {
+    return(data.table::data.table(GSL_UWI = character(), FirstProdDateInferred = as.Date(character())))
+  }
+  dt[, .(FirstProdDateInferred = min(PROD_DATE, na.rm = TRUE)), by = GSL_UWI]
+}
+
+is_zeroish <- function(boe, tol = 1.0) {
+  !is.na(boe) & boe <= tol
+}
 
 # --- 1. Define File Paths and Constants ---
 base_path <- app_base_dir
@@ -465,10 +669,10 @@ geometric_mean <- function(x, na.rm = TRUE) {
 final_sf_column_names <- c(
   "UWI", "GSL_UWI", "SurfaceLatitude", "SurfaceLongitude",
   "BH_Latitude", "BH_Longitude", "LateralLength",
-  "AbandonmentDate", "WellName", "CurrentStatus", "OperatorCode", "StratUnitID",
-  "SpudDate", "FirstProdDate", "FinalTD", "ProvinceState", "Country",
+  "AbandonmentDate", "CompletionDate", "WellName", "CurrentStatus", "OperatorCode", "StratUnitID",
+  "SpudDate", "RigReleaseDate", "FirstProdDate", "FinalTD", "ProvinceState", "Country",
   "UWI_Std", "GSL_UWI_Std", "OperatorName", "Formation", "FieldName",
-  "ConfidentialType"
+  "ConfidentialType", "LicensedSubstance"
 )
 empty_wells_df_for_sf <- data.frame(matrix(ncol = length(final_sf_column_names), nrow = 0))
 names(empty_wells_df_for_sf) <- final_sf_column_names
@@ -476,15 +680,17 @@ empty_wells_df_for_sf$UWI <- character(); empty_wells_df_for_sf$GSL_UWI <- chara
 empty_wells_df_for_sf$SurfaceLatitude <- numeric(); empty_wells_df_for_sf$SurfaceLongitude <- numeric()
 empty_wells_df_for_sf$BH_Latitude <- numeric(); empty_wells_df_for_sf$BH_Longitude <- numeric()
 empty_wells_df_for_sf$LateralLength <- numeric()
-empty_wells_df_for_sf$AbandonmentDate <- as.Date(character()); empty_wells_df_for_sf$WellName <- character()
+empty_wells_df_for_sf$AbandonmentDate <- as.Date(character()); empty_wells_df_for_sf$CompletionDate <- as.Date(character()); empty_wells_df_for_sf$WellName <- character()
 empty_wells_df_for_sf$CurrentStatus <- character(); empty_wells_df_for_sf$OperatorCode <- character()
 empty_wells_df_for_sf$StratUnitID <- character(); empty_wells_df_for_sf$SpudDate <- as.Date(character())
+empty_wells_df_for_sf$RigReleaseDate <- as.Date(character())
 empty_wells_df_for_sf$FirstProdDate <- as.Date(character()); empty_wells_df_for_sf$FinalTD <- numeric()
 empty_wells_df_for_sf$ProvinceState <- character(); empty_wells_df_for_sf$Country <- character()
 empty_wells_df_for_sf$UWI_Std <- character(); empty_wells_df_for_sf$GSL_UWI_Std <- character()
 empty_wells_df_for_sf$OperatorName <- character(); empty_wells_df_for_sf$Formation <- character()
 empty_wells_df_for_sf$FieldName <- character()
 empty_wells_df_for_sf$ConfidentialType <- character()
+empty_wells_df_for_sf$LicensedSubstance <- character()
 
 cached_value_template <- function(template_col) {
   if (inherits(template_col, "Date")) {
@@ -612,26 +818,195 @@ if (load_from_db) {
   app_data$company_layers_list <- list()
   
   if (is.null(con) || !dbIsValid(con)) { message("Attempting to (re)connect to database for data loading..."); con <- connect_to_db(); if (is.null(con) || !dbIsValid(con)) { stop("FATAL: Database connection failed. Cannot load primary data.") } }
-  
+
+  wd_join_condition <- "(WD.GSL_UWI = W.GSL_UWI OR WD.UWI = W.UWI)"
+  if (!is.null(con) && dbIsValid(con)) {
+    wd_cols_upper <- tryCatch({
+      info <- DBI::dbGetQuery(
+        con,
+        "SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE OWNER = 'CLIENT_VIEWS' AND TABLE_NAME = 'WELL_DRILLING_V11'"
+      )
+      unique(toupper(info$COLUMN_NAME))
+    }, error = function(e) {
+      sample_cols <- tryCatch({
+        sample_df <- DBI::dbGetQuery(con, "SELECT * FROM CLIENT_VIEWS.WELL_DRILLING_V11 WHERE ROWNUM <= 0")
+        if (is.data.frame(sample_df)) {
+          unique(toupper(names(sample_df)))
+        } else {
+          character(0)
+        }
+      }, error = function(e2) {
+        character(0)
+      })
+      sample_cols
+    })
+
+    if (length(wd_cols_upper)) {
+      if (!any(wd_cols_upper %in% c("UWI", "GSL_UWI", "GSL_UWI_STD"))) {
+        message("WARNING: CLIENT_VIEWS.WELL_DRILLING_V11 lacks explicit UWI/GSL_UWI columns; using fallback OR join on UWI")
+      }
+    } else {
+      message("WARNING: Unable to inspect CLIENT_VIEWS.WELL_DRILLING_V11 columns; defaulting rig release join to WD.UWI = W.UWI")
+    }
+  }
+  message("Rig release join condition: ", wd_join_condition)
+
+  wv_join_condition <- "(WV.GSL_UWI = W.GSL_UWI OR WV.UWI = W.UWI)"
+  if (!is.null(con) && dbIsValid(con)) {
+    wv_cols_upper <- tryCatch({
+      info <- DBI::dbGetQuery(
+        con,
+        "SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE OWNER = 'CLIENT_VIEWS' AND TABLE_NAME = 'WELL_VERSION_V11'"
+      )
+      unique(toupper(info$COLUMN_NAME))
+    }, error = function(e) {
+      sample_cols <- tryCatch({
+        sample_df <- DBI::dbGetQuery(con, "SELECT * FROM CLIENT_VIEWS.WELL_VERSION_V11 WHERE ROWNUM <= 0")
+        if (is.data.frame(sample_df)) unique(toupper(names(sample_df))) else character(0)
+      }, error = function(e2) character(0))
+      sample_cols
+    })
+    if (length(wv_cols_upper)) {
+      if (!any(wv_cols_upper %in% c("UWI", "GSL_UWI", "GSL_UWI_STD"))) {
+        message("WARNING: CLIENT_VIEWS.WELL_VERSION_V11 lacks explicit UWI/GSL_UWI columns; using fallback OR join on UWI")
+      }
+    } else {
+      message("WARNING: Unable to inspect CLIENT_VIEWS.WELL_VERSION_V11 columns; defaulting join to WV.UWI = W.UWI")
+    }
+  }
+
+  wl_join_condition <- "(WL.GSL_UWI = W.GSL_UWI OR WL.UWI = W.UWI)"
+  wc_join_condition <- "(WC.GSL_UWI = W.GSL_UWI OR WC.UWI = W.UWI)"
+  wf_join_condition <- "(WF.GSL_UWI = W.GSL_UWI OR WF.UWI = W.UWI)"
+
   sql_well_master_base <- paste0(
     "SELECT W.UWI, W.GSL_UWI, W.SURFACE_LATITUDE, W.SURFACE_LONGITUDE, ",
     "W.BOTTOM_HOLE_LATITUDE, W.BOTTOM_HOLE_LONGITUDE, W.GSL_FULL_LATERAL_LENGTH, ",
-    "W.ABANDONMENT_DATE, W.WELL_NAME, W.CURRENT_STATUS, W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE, ",
-    "P.STRAT_UNIT_ID, W.SPUD_DATE, PFS.FIRST_PROD_DATE, W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, FL.FIELD_NAME ",
+    "COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) AS ABANDONMENT_DATE, W.WELL_NAME, ",
+    "COALESCE(WV.CURRENT_STATUS, W.CURRENT_STATUS) AS CURRENT_STATUS, ",
+    "W.OPERATOR AS OPERATOR_CODE, W.CONFIDENTIAL_TYPE, ",
+    "P.STRAT_UNIT_ID, COALESCE(WV.SPUD_DATE, W.SPUD_DATE) AS SPUD_DATE, ",
+    "WD.RIG_RELEASE_DATE AS RIG_RELEASE_DATE, ",
+    "COALESCE(PFS.FIRST_PROD_DATE, WV.FIRST_PROD_DATE) AS FIRST_PROD_DATE, ",
+    "W.FINAL_TD, W.PROVINCE_STATE, W.COUNTRY, ",
+    "FL.FIELD_NAME, ",
+    "COALESCE(WL.GSL_LICENSE_SUBSTANCE, W.LICENSED_SUBSTANCE) AS LICENSED_SUBSTANCE, ",
+    "WV.LAHEE, WV.LAHEE_CLASS, WV.LAHEE_CLASSIFICATION, ",
+    "W.COMPLETION_DATE AS COMPLETION_DATE_WELL, ",
+    "WV.COMPLETION_DATE AS COMPLETION_DATE_WV, ",
+    "WC.COMPLETION_DATE AS COMPLETION_DATE_WC, ",
+    "WF.COMPLETION_END_DATE AS COMPLETION_END_DATE_WF, ",
+    "WF.COMPLETION_START_DATE AS COMPLETION_START_DATE_WF, ",
+    "COALESCE(WV.COMPLETION_DATE, W.COMPLETION_DATE) AS COMPLETION_DATE_BASE ",
     "FROM WELL W ",
     "LEFT JOIN PDEN P ON W.GSL_UWI = P.GSL_UWI ",
     "LEFT JOIN FIELD FL ON W.ASSIGNED_FIELD = FL.FIELD_ID ",
     "LEFT JOIN PDEN_FIRST_SUM PFS ON W.GSL_UWI = PFS.GSL_UWI ",
+    "LEFT JOIN CLIENT_VIEWS.WELL_DRILLING_V11 WD ON ", wd_join_condition, " ",
+    "LEFT JOIN CLIENT_VIEWS.WELL_VERSION_V11  WV ON ", wv_join_condition, " ",
+    "LEFT JOIN CLIENT_VIEWS.WELL_LICENSE_V11 WL ON ", wl_join_condition, " ",
+    "LEFT JOIN CLIENT_VIEWS.WELL_COMPLETION_V11 WC ON ", wc_join_condition, " ",
+    "LEFT JOIN CLIENT_VIEWS.GSL_WELL_FRAC_V11 WF ON ", wf_join_condition, " ",
     "WHERE W.SURFACE_LATITUDE IS NOT NULL AND W.SURFACE_LONGITUDE IS NOT NULL ",
-    "AND (W.ABANDONMENT_DATE IS NULL OR W.ABANDONMENT_DATE > SYSDATE - (365*20))"
+    "AND (COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) IS NULL ",
+    "     OR COALESCE(WV.ABANDONMENT_DATE, W.ABANDONMENT_DATE) > SYSDATE - (365*20))"
   )
   message("Fetching well master data from Oracle..."); wells_master_df_raw <- tryCatch({ dbGetQuery(con, sql_well_master_base) }, error = function(e) { warning(paste("Error fetching well master data from Oracle:", e$message)); data.frame() })
   wells_master_dt <- data.table::data.table()
   if (nrow(wells_master_df_raw) > 0) {
     message(paste("DB Load: Successfully loaded", nrow(wells_master_df_raw), "base well rows from DB.")); wells_master_dt <- data.table::as.data.table(wells_master_df_raw)
+    setnames(wells_master_dt, "FIELD_NAME", "FieldName", skip_absent = TRUE)
+    setnames(wells_master_dt, "LICENSED_SUBSTANCE", "LicensedSubstance", skip_absent = TRUE)
+    setnames(wells_master_dt, "COMPLETION_DATE_WELL", "CompletionDate_Well", skip_absent = TRUE)
+    setnames(wells_master_dt, "COMPLETION_DATE_WV", "CompletionDate_WV", skip_absent = TRUE)
+    setnames(wells_master_dt, "COMPLETION_DATE_WC", "CompletionDate_WC", skip_absent = TRUE)
+    setnames(wells_master_dt, "COMPLETION_END_DATE_WF", "CompletionEndDate_WF", skip_absent = TRUE)
+    setnames(wells_master_dt, "COMPLETION_START_DATE_WF", "CompletionStartDate_WF", skip_absent = TRUE)
+    setnames(wells_master_dt, "COMPLETION_DATE_BASE", "CompletionDateBase", skip_absent = TRUE)
+    setnames(wells_master_dt, "CURRENT_STATUS", "CurrentStatus", skip_absent = TRUE)
+    setnames(wells_master_dt, "LAHEE", "Lahee", skip_absent = TRUE)
+    setnames(wells_master_dt, "LAHEE_CLASS", "LaheeClass", skip_absent = TRUE)
+    setnames(wells_master_dt, "LAHEE_CLASSIFICATION", "LaheeClassification", skip_absent = TRUE)
+    setnames(wells_master_dt, "SPUD_DATE", "SpudDate", skip_absent = TRUE)
+    setnames(wells_master_dt, "RIG_RELEASE_DATE", "RigReleaseDate", skip_absent = TRUE)
+    setnames(wells_master_dt, "FIRST_PROD_DATE", "FirstProdDate", skip_absent = TRUE)
+    setnames(wells_master_dt, "ABANDONMENT_DATE", "AbandonmentDate", skip_absent = TRUE)
+    if("UWI" %in% names(wells_master_dt)) wells_master_dt[, UWI := norm_uwi(UWI)]
+    if("GSL_UWI" %in% names(wells_master_dt)) wells_master_dt[, GSL_UWI := norm_uwi(GSL_UWI)]
     if("UWI" %in% names(wells_master_dt)) wells_master_dt[, UWI_Std := standardize_uwi(UWI)] else wells_master_dt[, UWI_Std := NA_character_]
     if("GSL_UWI" %in% names(wells_master_dt)) wells_master_dt[, GSL_UWI_Std := standardize_uwi(GSL_UWI)] else wells_master_dt[, GSL_UWI_Std := NA_character_]
-    if (!"FIELD_NAME" %in% names(wells_master_dt)) { wells_master_dt[, FieldName := NA_character_] } else { setnames(wells_master_dt, "FIELD_NAME", "FieldName") }
+    date_cols_master <- intersect(c("SpudDate", "RigReleaseDate", "CompletionDate", "CompletionDateBase", "CompletionDate_Well", "CompletionDate_WV", "CompletionDate_WC", "CompletionEndDate_WF", "CompletionStartDate_WF", "FirstProdDate", "AbandonmentDate"), names(wells_master_dt))
+    for (dc in date_cols_master) wells_master_dt[, (dc) := as.IDate(get(dc))]
+    completion_sources <- intersect(c("CompletionDate", "CompletionDateBase", "CompletionDate_Well", "CompletionDate_WV", "CompletionDate_WC", "CompletionEndDate_WF", "CompletionStartDate_WF"), names(wells_master_dt))
+    if (length(completion_sources)) {
+      comp_mat <- do.call(cbind, lapply(completion_sources, function(col) as.integer(wells_master_dt[[col]])))
+      if (is.matrix(comp_mat)) {
+        max_vals <- apply(comp_mat, 1, function(row) {
+          row <- row[!is.na(row)]
+          if (length(row) == 0) NA_integer_ else max(row)
+        })
+        wells_master_dt[, CompletionDate := as.IDate(as.integer(max_vals))]
+      } else {
+        wells_master_dt[, CompletionDate := as.IDate(NA)]
+      }
+    } else if (!"CompletionDate" %in% names(wells_master_dt)) {
+      wells_master_dt[, CompletionDate := as.IDate(NA)]
+    }
+    if (!"FieldName" %in% names(wells_master_dt)) wells_master_dt[, FieldName := NA_character_]
+    if (!"LicensedSubstance" %in% names(wells_master_dt)) wells_master_dt[, LicensedSubstance := NA_character_]
+    if (!"CurrentStatus" %in% names(wells_master_dt)) wells_master_dt[, CurrentStatus := NA_character_]
+    if (!"Lahee" %in% names(wells_master_dt)) wells_master_dt[, Lahee := NA_character_]
+    if (!"LaheeClass" %in% names(wells_master_dt)) wells_master_dt[, LaheeClass := NA_character_]
+    if (!"LaheeClassification" %in% names(wells_master_dt)) wells_master_dt[, LaheeClassification := NA_character_]
+
+    wells_master_dt[, LaheeUnified := toupper(trimws(data.table::fifelse(
+      !is.na(Lahee) & Lahee != "", Lahee,
+      data.table::fifelse(
+        !is.na(LaheeClassification) & LaheeClassification != "", LaheeClassification,
+        data.table::fifelse(
+          !is.na(LaheeClass) & LaheeClass != "", LaheeClass,
+          NA_character_
+        )
+      )
+    )))]
+
+    rig_release_fallback_df <- tryCatch({
+      DBI::dbGetQuery(
+        con,
+        'SELECT UWI, "Date Rig Released" AS DATE_RIG_RELEASED FROM CLIENT_VIEWS.WELL_DRILLING_V11 WHERE "Date Rig Released" IS NOT NULL'
+      )
+    }, error = function(e) {
+      message("DUC DEBUG: Rig release fallback query failed: ", e$message)
+      data.frame()
+    })
+    if (nrow(rig_release_fallback_df) > 0) {
+      rig_release_dt <- data.table::as.data.table(rig_release_fallback_df)
+      rig_release_dt[, UWI := norm_uwi(UWI)]
+      rig_release_dt[, DATE_RIG_RELEASED := as.IDate(DATE_RIG_RELEASED)]
+      rig_release_dt <- rig_release_dt[!is.na(DATE_RIG_RELEASED)]
+      if (nrow(rig_release_dt)) {
+        rig_release_dt <- rig_release_dt[, .(DATE_RIG_RELEASED = max(DATE_RIG_RELEASED, na.rm = TRUE)), by = UWI]
+        if (!"RigReleaseDate" %in% names(wells_master_dt)) wells_master_dt[, RigReleaseDate := as.IDate(NA)]
+        setkey(rig_release_dt, UWI)
+        setkey(wells_master_dt, UWI)
+        wells_master_dt <- rig_release_dt[wells_master_dt]
+        wells_master_dt[, RigReleaseDate := data.table::fifelse(is.na(RigReleaseDate), DATE_RIG_RELEASED, RigReleaseDate)]
+        wells_master_dt[, DATE_RIG_RELEASED := NULL]
+        setkey(wells_master_dt, NULL)
+        message("DUC DEBUG: RigReleaseDate NA count after fallback join: ",
+                sum(is.na(wells_master_dt$RigReleaseDate)), " / ", nrow(wells_master_dt))
+      }
+    } else {
+      message("DUC DEBUG: Rig release fallback query returned no rows; continuing with existing RigReleaseDate values.")
+    }
+
+    wells_master_dt[, is_abandoned := {
+      st <- toupper(trimws(as.character(CurrentStatus)))
+      dt <- as.IDate(AbandonmentDate)
+      nz <- !is.na(dt)
+      pat <- !is.na(st) & grepl("(^|[^A-Z])ABD|ABAND|ABANDON|ABDN|ABAND'D|ABANDONED", st, perl = TRUE)
+      nz | pat
+    }]
     if (!"STRAT_UNIT_ID" %in% names(wells_master_dt)) wells_master_dt[, STRAT_UNIT_ID := NA_character_]; wells_master_dt[, STRAT_UNIT_ID := as.character(STRAT_UNIT_ID)]
     
     if ("CONFIDENTIAL_TYPE" %in% names(wells_master_dt)) {
@@ -684,13 +1059,17 @@ if (load_from_db) {
       "SURFACE_LONGITUDE"="SurfaceLongitude",
       "BOTTOM_HOLE_LATITUDE"="BH_Latitude", "BOTTOM_HOLE_LONGITUDE"="BH_Longitude",
       "GSL_FULL_LATERAL_LENGTH"="LateralLength", # Updated mapping for LateralLength
-      "ABANDONMENT_DATE"="AbandonmentDate", "WELL_NAME"="WellName", "CURRENT_STATUS"="CurrentStatus",
+      "ABANDONMENT_DATE"="AbandonmentDate", "COMPLETION_DATE"="CompletionDate", "WELL_NAME"="WellName", "CURRENT_STATUS"="CurrentStatus",
       "OPERATOR_CODE"="OperatorCode", "STRAT_UNIT_ID"="StratUnitID",
-      "SPUD_DATE"="SpudDate", "FIRST_PROD_DATE"="FirstProdDate",
+      "SPUD_DATE"="SpudDate", "RIG_RELEASE_DATE"="RigReleaseDate", "FIRST_PROD_DATE"="FirstProdDate",
       "FINAL_TD"="FinalTD", "PROVINCE_STATE"="ProvinceState", "COUNTRY"="Country",
+      "COMPLETION_DATE_BASE"="CompletionDateBase", "COMPLETION_DATE_WELL"="CompletionDate_Well",
+      "COMPLETION_DATE_WV"="CompletionDate_WV", "COMPLETION_DATE_WC"="CompletionDate_WC",
+      "COMPLETION_END_DATE_WF"="CompletionEndDate_WF", "COMPLETION_START_DATE_WF"="CompletionStartDate_WF",
       "UWI_Std"="UWI_Std", "GSL_UWI_Std"="GSL_UWI_Std",
       "OperatorNameDisplay"="OperatorName", "Formation"="Formation", "FieldName"="FieldName",
-      "CONFIDENTIAL_TYPE"="ConfidentialType"
+      "CONFIDENTIAL_TYPE"="ConfidentialType", "LICENSED_SUBSTANCE"="LicensedSubstance",
+      "LAHEE"="Lahee", "LAHEE_CLASS"="LaheeClass", "LAHEE_CLASSIFICATION"="LaheeClassification"
     )
     current_db_names <- names(combined_wells_dt)
     for (db_name in names(db_to_r_names_map)) {
@@ -714,6 +1093,12 @@ if (load_from_db) {
         if (col_sf == "ConfidentialType" && !is.character(combined_wells_dt[[col_sf]])) {
           combined_wells_dt[, (col_sf) := as.character(get(col_sf))]
         }
+        if (col_sf == "CurrentStatus" && !is.character(combined_wells_dt[[col_sf]])) {
+          combined_wells_dt[, (col_sf) := as.character(get(col_sf))]
+        }
+        if (col_sf == "LicensedSubstance" && !is.character(combined_wells_dt[[col_sf]])) {
+          combined_wells_dt[, (col_sf) := as.character(get(col_sf))]
+        }
         if (col_sf == "BH_Latitude" && !is.numeric(combined_wells_dt[[col_sf]])) {
           combined_wells_dt[, (col_sf) := as.numeric(get(col_sf))]
         }
@@ -728,7 +1113,7 @@ if (load_from_db) {
     
     if("SurfaceLatitude" %in% names(combined_wells_dt) && !is.numeric(combined_wells_dt$SurfaceLatitude)) combined_wells_dt[, SurfaceLatitude := as.numeric(SurfaceLatitude)]
     if("SurfaceLongitude" %in% names(combined_wells_dt) && !is.numeric(combined_wells_dt$SurfaceLongitude)) combined_wells_dt[, SurfaceLongitude := as.numeric(SurfaceLongitude)]
-    date_cols_to_convert_pascal <- c("SpudDate", "FirstProdDate", "AbandonmentDate")
+    date_cols_to_convert_pascal <- c("SpudDate", "RigReleaseDate", "FirstProdDate", "AbandonmentDate", "CompletionDate")
     for(dc_pascal in date_cols_to_convert_pascal){ if(dc_pascal %in% names(combined_wells_dt) && !inherits(combined_wells_dt[[dc_pascal]], "Date")){ current_col_values <- combined_wells_dt[[dc_pascal]]; if(inherits(current_col_values, "POSIXct") || inherits(current_col_values, "POSIXlt")) { combined_wells_dt[, (dc_pascal) := as.Date(current_col_values)] } else { combined_wells_dt[, (dc_pascal) := as.Date(as.character(current_col_values), origin = "1970-01-01")] } } }
     combined_wells_for_sf <- combined_wells_dt[!is.na(SurfaceLatitude) & !is.na(SurfaceLongitude)]
     if (nrow(combined_wells_for_sf) > 0) {
@@ -912,7 +1297,20 @@ ui <- fluidPage(
       width = 9,
       tabsetPanel(
         id = "main_tabs",
-        tabPanel("Well Map", leafletOutput("well_map", height = "85vh")),
+        tabPanel(
+          "Well Map",
+          div(
+            style = "max-width: 320px; margin-bottom: 10px;",
+            radioButtons(
+              "well_color_metric",
+              "Color wells by:",
+              choices = c("Gas weighting (%)" = "gas_weight", "GOR (MCF/BBL)" = "gor"),
+              selected = "gas_weight",
+              inline = FALSE
+            )
+          ),
+          leafletOutput("well_map", height = "85vh")
+        ),
         tabPanel("Production Analysis",
                  fluidRow(
                    column(12,
@@ -928,7 +1326,13 @@ ui <- fluidPage(
                    id = "prod_analysis_tabs",
                    tabPanel("Single Well Analysis",
                             h4("Daily Production Rate"),
-                            selectInput("selected_well_for_prod", "Select Well for Production:", choices = c("Apply filters and click a well on map or select here" = "")),
+                            selectizeInput(
+                              "selected_well_for_prod",
+                              "Well(s) for production view:",
+                              choices = NULL,
+                              multiple = TRUE,
+                              options = list(placeholder = "Type to search…")
+                            ),
                             uiOutput("production_date_slider_ui"),
                             plotlyOutput("production_plot", height = "45vh"),
                             hr(),
@@ -985,17 +1389,61 @@ ui <- fluidPage(
                             h5("Aggregated Data Used for Type Curve (Avg Daily Rate vs. Months Since Peak)"),
                             DT::dataTableOutput("arps_data_table")
                    ),
-                   tabPanel("GOR",
-                            h4("GOR & Gas Weighting (Map-filtered wells)"),
-                            p("Uses current main filters, date range, and the Oil+Condensate toggle."),
-                            fluidRow(
-                              column(6, plotOutput("gor_trend_by_month_plot", height = "45vh")),
-                              column(6, plotOutput("gas_weighting_by_vintage_plot", height = "45vh"))
-                            ),
-                            hr(),
-                            downloadButton("download_gor_timeseries_csv", "Download GOR Timeseries (CSV)"),
-                            DT::dataTableOutput("gor_timeseries_table")
-                   ),
+                  tabPanel("GOR",
+                           h4("GOR & Gas Weighting (Map-filtered wells)"),
+                           p("Uses current main filters, date range, and the Oil+Condensate toggle."),
+                           fluidRow(
+                             column(4,
+                                    selectInput(
+                                      "gor_group_by",
+                                      "Group / color series by:",
+                                      choices = c(
+                                        "Operator" = "OperatorName",
+                                        "Formation" = "Formation",
+                                        "Field" = "FieldName",
+                                        "Province/State" = "ProvinceState"
+                                      ),
+                                      selected = "OperatorName"
+                                    )
+                             ),
+                             column(4,
+                                    dateRangeInput(
+                                      "gor_calendar_range",
+                                      "Calendar production window:",
+                                      start = Sys.Date() - lubridate::years(5),
+                                      end = Sys.Date(),
+                                      min = as.Date("2000-01-01"),
+                                      max = Sys.Date()
+                                    )
+                             ),
+                             column(4,
+                                    sliderInput(
+                                      "gor_firstprod_years",
+                                      "Only include wells with FirstProdDate year in range:",
+                                      min = 2000,
+                                      max = lubridate::year(Sys.Date()),
+                                      value = c(lubridate::year(Sys.Date()) - 5, lubridate::year(Sys.Date())),
+                                      step = 1
+                                    )
+                             )
+                           ),
+                           fluidRow(
+                             column(6, plotlyOutput("gor_trend_by_month_plot", height = "45vh")),
+                             column(6, plotlyOutput("gas_weighting_by_vintage_plot", height = "45vh"))
+                           ),
+                           fluidRow(
+                             column(4,
+                                    checkboxInput(
+                                      "trim_outliers",
+                                      "Trim GOR outliers (winsorize 1st-99th percentile per group)",
+                                      value = FALSE
+                                    )
+                             )
+                           ),
+                           hr(),
+                           downloadButton("download_gor_timeseries_csv", "Download GOR Timeseries (CSV)"),
+                           DT::dataTableOutput("gor_timeseries_table")
+                  ),
                    tabPanel("Operator Group Cumulative",
                             h4("Operator Group Average Daily Production Rate"),
                             p(strong("Note:"), " This tab shows gross production for selected operators over a specific date range, independent of map filters. For operator comparisons within the main filter context (Formation, Field, Province, Date), please use the 'Filtered Group Cumulative' tab."),
@@ -1019,15 +1467,250 @@ ui <- fluidPage(
                                      selectInput("gp_month", "Month", choices = c("Loading..." = ""), selected = NULL),
                                      actionButton("gp_reload", "Load Gas Plant Data", class = "btn-primary")
                               ),
-                              column(8,
+                              column(4,
+                                     selectInput(
+                                       "gp_color_by",
+                                       "Color by",
+                                       choices = c("Utilization" = "util", "Operator" = "op"),
+                                       selected = "util"
+                                     ),
+                                     helpText("Utilization = Monthly Throughput / Monthly Capacity (from ST50).")
+                              ),
+                              column(4,
                                      helpText("Decoupled from well filters. Uses monthly volumes + ST50 capacity. Operator from monthly file.")
                               )
                             ),
                             leafletOutput("gp_map", height = "75vh"),
                             br(),
                             DT::DTOutput("gp_table")
-                   )
-                 )
+                   ),
+                   tabPanel("DUCs Over Time",
+                            fluidRow(
+                              column(
+                                width = 4,
+
+                                shinyWidgets::airDatepickerInput(
+                                  inputId = "duc_dates",
+                                  label   = "Snapshot dates",
+                                  value   = c(as.Date("2024-12-31"), as.Date("2025-12-31")),
+                                  multiple = TRUE,
+                                  clearButton = TRUE
+                                ),
+
+                                sliderInput(
+                                  "duc_min_hold_days",
+                                  "Min days since rig release to count as DUC",
+                                  min = 0,
+                                  max = 180,
+                                  value = 30,
+                                  step = 10
+                                ),
+
+                                sliderInput(
+                                  "duc_max_hold_days",
+                                  "Max days allowed since rig release (exclude long-term zombies)",
+                                  min = 30,
+                                  max = 2000,
+                                  value = 730,
+                                  step = 30
+                                ),
+
+                                sliderInput(
+                                  "duc_spud_recency_months",
+                                  "Only include wells rig-released in last __ months (recency window)",
+                                  min = 1,
+                                  max = 60,
+                                  value = 36,
+                                  step = 1
+                                ),
+
+                                numericInput(
+                                  "duc_grace_days",
+                                  "Grace after release (days):",
+                                  value = 30,
+                                  min = 0,
+                                  max = 365,
+                                  step = 5
+                                ),
+
+                                numericInput(
+                                  "duc_max_age_days",
+                                  "Max age since release (days, 0 = none):",
+                                  value = 0,
+                                  min = 0,
+                                  max = 3650,
+                                  step = 30
+                                ),
+
+                                sliderInput(
+                                  "duc_max_months_cap",
+                                  "Max months between rig release and first production to still call it 'DUC' (ignore wells that have been sitting longer than this many months without first production)",
+                                  min = 1,
+                                  max = 120,
+                                  value = 24,
+                                  step = 1
+                                ),
+
+                                checkboxInput(
+                                  "duc_exclude_conf",
+                                  "Exclude wells flagged Confidential",
+                                  value = TRUE
+                                ),
+
+                                selectizeInput(
+                                  "duc_substance_filter",
+                                  "Licensed Substance",
+                                  choices = NULL,
+                                  multiple = TRUE,
+                                  options = list(placeholder = "Select commodities to include")
+                                ),
+
+                                checkboxInput(
+                                  "duc_include_unknown_substance",
+                                  "Include Unknown commodity",
+                                  value = TRUE
+                                ),
+
+                                selectInput(
+                                  "duc_lahee_filter",
+                                  "Lahee classification",
+                                  choices = c("All", "Development"),
+                                  selected = "All"
+                                ),
+
+                                selectInput(
+                                  "duc_group_by",
+                                  "Group DUC counts by",
+                                  choices = c(
+                                    "Operator"        = "OperatorName",
+                                    "Formation"       = "Formation",
+                                    "Field"           = "FieldName",
+                                    "Province/State"  = "ProvinceState"
+                                  ),
+                                  selected = "OperatorName"
+                                ),
+
+                                uiOutput("duc_group_filter_ui"),
+
+                                actionButton(
+                                  "duc_apply",
+                                  "Calculate DUCs",
+                                  class = "btn-primary"
+                                ),
+
+                                br(),
+                                helpText("See below for the detailed DUC definition used in this tool."),
+                                wellPanel(
+                                  tags$strong("How this tool defines a DUC"),
+                                  tags$ul(
+                                    tags$li("You pick one or more snapshot dates (these can be month-ends or any reference date)."),
+                                    tags$li(
+                                      "For each snapshot date D, a well is counted as a DUC if:",
+                                      tags$ul(
+                                        tags$li("The well reached rig release on or before D (RigReleaseDate ≤ D), falling back to SpudDate only when RigReleaseDate is missing."),
+                                        tags$li("The well has NOT started first production on/before D (FirstProdDate is blank OR FirstProdDate > D)."),
+                                        tags$li("The well is not abandoned as of D (AbandonmentDate is blank OR AbandonmentDate > D)."),
+                                        tags$li("The well is not completed as of D (CompletionDate is blank OR CompletionDate > D)."),
+                                        tags$li("The well has existed at least [Min days since rig release] days by D."),
+                                        tags$li("The well has existed no more than [Max days allowed since rig release] days by D (drops multi-year zombies / economic suspensions)."),
+                                        tags$li("The well was rig-released within the last [Recency window in months] months as of D (optional high-grading for current programs)."),
+                                        tags$li("The gap between rig release and first production is within [Max months between rig release and first production] months (prevents including very old inventory)."),
+                                        tags$li("If 'Exclude wells flagged Confidential' is checked, wells flagged Confidential are dropped.")
+                                      )
+                                    ),
+                                    tags$li("Counts are grouped by the selected dimension (Operator, Province/State, Formation, Field, etc.)."),
+                                    tags$li("The bar chart shows DUC totals for each snapshot date side by side."),
+                                    tags$li("The downloadable detail table lists every UWI counted as a DUC at each snapshot date, along with key timestamps.")
+                                  ),
+                                  tags$small("Counts are grouped by the selected dimension (Operator, Formation, Field, Province). The bar chart shows absolute DUC totals per snapshot date, not just deltas.")
+                                )
+                              ),
+                              column(8,
+                                     h4(textOutput("duc_headline")),
+                                     plotlyOutput("duc_bar_compare", height = "45vh"),
+                                     br(),
+                                     DTOutput("duc_pivot"),
+                                     br(),
+                                     downloadButton("duc_download", "Download DUC table (CSV)"),
+                                     DTOutput("duc_table"),
+                                     checkboxInput("duc_show_rows", "Show row-level DUCs (paged)", value = FALSE),
+                                     DTOutput("duc_rows"),
+                                     hr(),
+                                     h4("DUC detail (well-level)"),
+                                     div(style = "margin-bottom:8px;",
+                                         downloadButton("download_duc_details_csv", "Download DUC detail (CSV)")
+                                      ),
+                                      DT::DTOutput("duc_detail_table")
+                              )
+                            )
+                  ),
+                  tabPanel(
+                    "Shut-in Wells",
+                    fluidRow(
+                      column(
+                        width = 3,
+                        dateInput(
+                          "shutin_snapshot_date",
+                          "Snapshot date (as of):",
+                          value = Sys.Date(),
+                          min = as.Date("2015-01-01"),
+                          max = Sys.Date()
+                        ),
+                        numericInput(
+                          "shutin_no_prod_months",
+                          "No production for at least (months):",
+                          value = 2,
+                          min = 1,
+                          max = 60,
+                          step = 1
+                        ),
+                        numericInput(
+                          "shutin_recent_production_window",
+                          "Must have produced at least once in last (months) before snapshot:",
+                          value = 24,
+                          min = 0,
+                          max = 120,
+                          step = 1
+                        ),
+                        numericInput(
+                          "shutin_residual_boe_threshold",
+                          "Treat months with ≤ this many BOE as zero:",
+                          value = 3,
+                          min = 0,
+                          max = 50,
+                          step = 0.5
+                        ),
+                        uiOutput("shutin_residual_hint"),
+                        actionButton(
+                          "calculate_shutin",
+                          "Calculate shut-in wells",
+                          class = "btn-primary"
+                        ),
+                        helpText(
+                          "Definition of 'shut-in' here:
+",
+                          "1) Well produced at least once in the last 'recent activity' window (X months before the snapshot).
+",
+                          "2) The well has zero production for EACH of the most recent 'no production' window (Y months before the snapshot).
+",
+                          "3) AbandonmentDate is blank or after the snapshot.
+",
+                          "This excludes dead wells that haven't flowed in years and focuses on wells that were active recently but are currently turned off."
+                        )
+                      ),
+                      column(
+                        width = 9,
+                        plotOutput("shutin_plot", height = 350),
+                        div(
+                          style = "margin: 10px 0; display: flex; flex-wrap: wrap; gap: 10px;",
+                          downloadButton("shutin_summary_download", "Download shut-in summary (CSV)"),
+                          downloadButton("shutin_detail_download", "Download shut-in detail (CSV)")
+                        ),
+                        DTOutput("shutin_table")
+                      )
+                    )
+                  )
+                )
         )
       )
     )
@@ -1036,8 +1719,28 @@ ui <- fluidPage(
 
 # --- Server Logic ---
 server <- function(input, output, session) {
-  
+
   wells_sf <- wells_sf_global
+
+  # --- Helper: get operator choices with fallbacks & "(Unknown)" ---
+  get_operator_choices <- function(sf_obj) {
+    if (is.null(sf_obj) || !inherits(sf_obj, "sf") || nrow(sf_obj) == 0) return(character(0))
+    op <- trimws(as.character(sf::st_drop_geometry(sf_obj)$OperatorName))
+    # fallback to Excel join names if OperatorName mostly NA
+    if (all(is.na(op) | op == "")) {
+      if ("OperatorNameDisplay" %in% names(sf_obj)) {
+        op <- trimws(as.character(sf_obj$OperatorNameDisplay))
+      }
+    }
+    # fallback to any alternative columns already in the file
+    if (all(is.na(op) | op == "") && "Operator" %in% names(sf_obj)) {
+      op <- trimws(as.character(sf_obj$Operator))
+    }
+    op <- op[!is.na(op) & op != "" & op != "NA"]
+    op <- sort(unique(op))
+    if (!length(op)) op <- "(Unknown)"
+    op
+  }
   play_subplay_layers_list <- play_subplay_layers_list_global
   company_layers_list <- company_layers_list_global
   
@@ -1050,11 +1753,28 @@ server <- function(input, output, session) {
     min_prod_date = as.Date("1900-01-01"),
     max_prod_date = Sys.Date(),
     min_first_prod_date_overall = as.Date("1900-01-01"),
-    max_first_prod_date_overall = Sys.Date()
+    max_first_prod_date_overall = Sys.Date(),
+    duc_comp = data.table::data.table(),
+    duc_detail = data.table::data.table(),
+    duc_groups_available = character(0),
+    duc_substance_choices = character(0),
+    lahee_notice_shown = FALSE,
+    completion_notice_shown = FALSE,
+    shutin_summary = data.table::data.table(),
+    shutin_detail = data.table::data.table(),
+    shutin_snapshot = as.Date(NA),
+    shutin_no_prod_months = NA_real_,
+    shutin_recent_production_window = NA_real_,
+    shutin_residual_threshold = NA_real_
   )
+
+  # --- PATCH 1A: safe boolean for "Oil + Condensate" toggle
+  use_cnd_reactive <- reactive({ isTRUE(input$gor_include_cnd) })
 
   fetch_monthly_gor <- function(uwi_vec, date_start, date_end, use_cnd = TRUE) {
     if (length(uwi_vec) == 0) return(data.table::data.table())
+
+    use_cnd <- isTRUE(use_cnd)
 
     if (is.null(con) || !DBI::dbIsValid(con)) {
       con <<- connect_to_db()
@@ -1124,17 +1844,10 @@ server <- function(input, output, session) {
       if (!is.numeric(out[[col]])) out[, (col) := as.numeric(get(col))]
       out[is.na(get(col)), (col) := 0]
     }
-    include_cnd_flag <- isTRUE(use_cnd)
-    out[, LiquidsBBL := OilBBL + if (isTRUE(include_cnd_flag)) CndBBL else 0]
-    out[, GOR_MCF_PER_BBL := data.table::fifelse(
-      LiquidsBBL > 0, GasMCF / LiquidsBBL,
-      data.table::fifelse(GasMCF > 0, Inf, NA_real_)
-    )]
-    out[, GasWeighting := data.table::fifelse(
-      (GasMCF + LiquidsBBL) > 0,
-      GasMCF / (GasMCF + LiquidsBBL),
-      NA_real_
-    )]
+    out[, LiquidsBBL := OilBBL + if (use_cnd) CndBBL else 0]
+    out[, GOR_MCF_PER_BBL := data.table::fifelse(LiquidsBBL > 0, GasMCF / LiquidsBBL, NA_real_)]
+    out[!is.finite(GOR_MCF_PER_BBL) | GOR_MCF_PER_BBL < 0, GOR_MCF_PER_BBL := NA_real_]
+    out[, GasWeighting := data.table::fifelse((GasMCF + LiquidsBBL) > 0, GasMCF / (GasMCF + LiquidsBBL), NA_real_)]
 
     data.table::setorder(out, GSL_UWI_STD, PROD_DATE)
     latest <- out[, .SD[.N], by = GSL_UWI_STD]
@@ -1151,8 +1864,10 @@ server <- function(input, output, session) {
     latest[]
   }
 
-  compute_gor_timeseries_for_wells <- function(uwi_vec, date_start, date_end, include_cnd = TRUE) {
+  compute_gor_timeseries_for_wells <- function(uwi_vec, date_start, date_end, use_cnd = TRUE) {
     if (length(uwi_vec) == 0) return(data.table::data.table())
+
+    use_cnd <- isTRUE(use_cnd)
 
     if (is.null(con) || !DBI::dbIsValid(con)) {
       con <<- connect_to_db()
@@ -1227,30 +1942,21 @@ server <- function(input, output, session) {
       if (!is.numeric(out[[col]])) out[, (col) := as.numeric(get(col))]
       out[is.na(get(col)), (col) := 0]
     }
-    include_cnd_flag <- isTRUE(include_cnd)
-    out[, LiquidsBBL := OilBBL + if (isTRUE(include_cnd_flag)) CndBBL else 0]
-    out[, GOR_MCF_PER_BBL := data.table::fifelse(
-      LiquidsBBL > 0, GasMCF / LiquidsBBL,
-      data.table::fifelse(GasMCF > 0, Inf, NA_real_)
-    )]
-    out[, GasWeighting := data.table::fifelse(
-      (GasMCF + LiquidsBBL) > 0,
-      GasMCF / (GasMCF + LiquidsBBL),
-      NA_real_
-    )]
+    out[, LiquidsBBL := OilBBL + if (use_cnd) CndBBL else 0]
+    out[, GOR_MCF_PER_BBL := data.table::fifelse(LiquidsBBL > 0, GasMCF / LiquidsBBL, NA_real_)]
+    out[!is.finite(GOR_MCF_PER_BBL) | GOR_MCF_PER_BBL < 0, GOR_MCF_PER_BBL := NA_real_]
+    out[, GasWeighting := data.table::fifelse((GasMCF + LiquidsBBL) > 0, GasMCF / (GasMCF + LiquidsBBL), NA_real_)]
 
     data.table::setorder(out, GSL_UWI_STD, PROD_DATE)
     out
   }
 
-  # —— Robust capping for GOR used in color/plots ——
+  # Cap Inf/huge GOR values for plotting only
   cap_gor_for_plot <- function(x) {
     x_num <- suppressWarnings(as.numeric(x))
     finite <- is.finite(x_num)
-    if (!any(finite, na.rm = TRUE)) {
-      return(list(vals = rep(NA_real_, length(x_num)), cap = NA_real_))
-    }
-    cap <- stats::quantile(x_num[finite], probs = 0.99, na.rm = TRUE, type = 7)
+    if (!any(finite)) return(list(vals = rep(NA_real_, length(x_num)), cap = NA_real_))
+    cap <- stats::quantile(x_num[finite], probs = 0.99, na.rm = TRUE)
     if (!is.finite(cap) || is.na(cap) || cap <= 0) cap <- max(x_num[finite], na.rm = TRUE)
     if (!is.finite(cap) || is.na(cap) || cap <= 0) cap <- 1
     x_cap <- x_num
@@ -1259,26 +1965,23 @@ server <- function(input, output, session) {
     list(vals = x_cap, cap = cap)
   }
 
-  # —— Palette that never produces duplicate breaks ——
-  safe_gor_palette <- function(x, n = 7) {
-    x_num <- suppressWarnings(as.numeric(x))
-    dom <- x_num[is.finite(x_num)]
-    if (length(dom) < 2 || (max(dom) - min(dom)) <= .Machine$double.eps) {
-      rng <- range(dom, na.rm = TRUE)
-      if (!is.finite(rng[1])) rng <- c(0, 1)
-      return(leaflet::colorNumeric("viridis", domain = rng))
+  # --- PATCH 2: robust breaks for GOR
+  make_gor_palette <- function(gor_vec, n = 7) {
+    gor_vec <- as.numeric(gor_vec)
+    gor_vec <- gor_vec[is.finite(gor_vec) & gor_vec >= 0]
+    if (length(gor_vec) == 0L) {
+      return(leaflet::colorNumeric("viridis", domain = c(0, 1)))
     }
-    qs <- stats::quantile(dom, probs = seq(0, 1, length.out = n + 1), na.rm = TRUE)
-    uq <- unique(as.numeric(qs))
-    if (length(uq) <= 2) {
-      brks <- pretty(range(dom, na.rm = TRUE), n = n)
-      brks <- unique(brks)
-      if (length(brks) < 3) {
-        return(leaflet::colorNumeric("viridis", domain = range(dom, na.rm = TRUE)))
-      }
-      return(leaflet::colorBin("viridis", domain = dom, bins = brks, pretty = FALSE))
+    rng <- range(gor_vec, na.rm = TRUE)
+    if (diff(rng) <= .Machine$double.eps) {
+      rng[2] <- rng[1] + 1e-9
     }
-    leaflet::colorQuantile("viridis", domain = dom, n = n)
+    br <- unique(as.numeric(stats::quantile(gor_vec, probs = seq(0, 1, length.out = n), na.rm = TRUE)))
+    br <- sort(unique(c(rng[1], br, rng[2])))
+    if (length(br) < 3L) {
+      br <- c(rng[1], rng[2] + 1e-9)
+    }
+    leaflet::colorBin("viridis", domain = gor_vec, bins = br, right = FALSE, na.color = "#9E9E9E")
   }
 
   compute_map_with_gor <- function(base_df) {
@@ -1311,9 +2014,7 @@ server <- function(input, output, session) {
     date_vals <- input$well_date_filter
     date_start <- if (!is.null(date_vals) && length(date_vals) >= 1) date_vals[1] else Sys.Date() - years(10)
     date_end <- if (!is.null(date_vals) && length(date_vals) >= 2) date_vals[2] else Sys.Date()
-    use_cnd <- isTRUE(input$gor_include_cnd)
-
-    gor_latest <- fetch_monthly_gor(map_uwis, date_start, date_end, use_cnd = use_cnd)
+    gor_latest <- fetch_monthly_gor(map_uwis, date_start, date_end, use_cnd = use_cnd_reactive())
 
     df_out$GOR_Latest <- NA_real_
     df_out$GOR_Latest_Month <- as.Date(NA)
@@ -1398,11 +2099,388 @@ server <- function(input, output, session) {
     current_selection <- isolate(reactive_vals$current_selected_gsl_uwi_std)
     valid_options <- unname(well_choices_for_prod[well_choices_for_prod != ""])
     if (!is.null(current_selection) && current_selection %in% valid_options) {
-      updateSelectInput(session, "selected_well_for_prod", choices = well_choices_for_prod, selected = current_selection)
+      updateSelectizeInput(
+        session,
+        "selected_well_for_prod",
+        choices = well_choices_for_prod,
+        selected = current_selection,
+        server = TRUE
+      )
     } else {
-      updateSelectInput(session, "selected_well_for_prod", choices = well_choices_for_prod, selected = "")
+      updateSelectizeInput(
+        session,
+        "selected_well_for_prod",
+        choices = well_choices_for_prod,
+        selected = character(0),
+        server = TRUE
+      )
       if (!is.null(current_selection) && current_selection != "") reactive_vals$current_selected_gsl_uwi_std <- NULL
     }
+  }
+
+  # ---- DUC logic helpers ----
+
+  # Returns TRUE/FALSE vector telling whether each row is considered a DUC
+  is_duc_at <- function(
+    dt,
+    snap_date,
+    min_hold_days      = 30L,
+    max_hold_days      = 730L,
+    recency_months     = 36L,
+    max_months_cap     = 24L,
+    exclude_conf       = TRUE,
+    grace_days         = 0L,
+    max_age_days       = 0L
+  ) {
+    d <- as.Date(snap_date)
+
+    drill_done_date <- data.table::fcoalesce(as.Date(dt$RigReleaseDate), as.Date(dt$SpudDate))
+
+    # Core conditions
+    drilled_before_snap <- !is.na(drill_done_date) & drill_done_date <= d
+    not_on_prod_yet     <- (is.na(dt$FirstProdDate) | dt$FirstProdDate > d)
+    completion_date     <- as.Date(dt$CompletionDate)
+    completed_by_snap   <- !is.na(completion_date) & completion_date <= d
+    status_norm <- tolower(trimws(as.character(dt$CurrentStatus)))
+    status_not_abandoned <- is.na(status_norm) | !grepl("abd|aband", status_norm, perl = TRUE)
+    not_abandoned       <- (is.na(dt$AbandonmentDate) | dt$AbandonmentDate > d) & status_not_abandoned
+
+    # Age since drilling finished (rig release or spud fallback) at snapshot
+    age_days <- as.numeric(d - drill_done_date)
+
+    grace_days <- max(0, as.numeric(grace_days))
+    min_hold_days <- max(0, as.numeric(min_hold_days))
+    effective_min <- max(min_hold_days, grace_days)
+    # 1. Minimum hold threshold (exclude wells that are too fresh after drill finish)
+    long_enough <- !is.na(age_days) & (age_days >= effective_min)
+
+    # 2. Maximum hold threshold (exclude zombie wells that have sat for years)
+    max_hold_days <- as.numeric(max_hold_days)
+    max_age_days <- as.numeric(max_age_days)
+    max_cap <- if (is.na(max_hold_days) || max_hold_days <= 0) Inf else max_hold_days
+    if (!is.na(max_age_days) && max_age_days > 0) {
+      max_cap <- min(max_cap, max_age_days)
+    }
+    not_too_old <- !is.na(age_days) & age_days <= max_cap
+
+    # 3. Recency filter: drill finish must be within the last N months at snapshot
+    #    Convert months to ~30.4375 days for a rough but consistent cutoff.
+    recency_months <- as.numeric(recency_months)
+    if (is.na(recency_months) || recency_months <= 0) {
+      recent_enough <- TRUE
+    } else {
+      recency_days <- recency_months * 30.4375
+      recent_enough <- !is.na(age_days) & (age_days <= recency_days)
+    }
+
+    # 4. Maximum months between drill finish and first production cap
+    first_prod_diff_days <- data.table::fifelse(
+      is.na(drill_done_date),
+      NA_real_,
+      data.table::fifelse(
+        is.na(dt$FirstProdDate),
+        0,
+        pmax(0, as.numeric(dt$FirstProdDate - drill_done_date))
+      )
+    )
+    months_between_release_and_firstprod <- first_prod_diff_days / 30.4375
+    max_months_cap <- as.numeric(max_months_cap)
+    if (is.na(max_months_cap) || max_months_cap <= 0) {
+      within_month_cap <- !is.na(months_between_release_and_firstprod)
+    } else {
+      within_month_cap <- !is.na(months_between_release_and_firstprod) &
+        (months_between_release_and_firstprod <= max_months_cap)
+    }
+
+    # Confidential filter
+    if (exclude_conf) {
+      conf_ok <- (is.na(dt$ConfidentialType) |
+                  dt$ConfidentialType == "" |
+                  toupper(dt$ConfidentialType) == "NON-CONFIDENTIAL")
+    } else {
+      conf_ok <- TRUE
+    }
+
+    drilled_before_snap &
+      not_on_prod_yet &
+      not_abandoned &
+      !completed_by_snap &
+      long_enough &
+      not_too_old &
+      recent_enough &
+      within_month_cap &
+      conf_ok
+  }
+
+  duc_detail_for_date <- function(
+    wx_dt,
+    snap_date,
+    min_hold_days,
+    max_hold_days,
+    recency_months,
+    max_months_cap,
+    exclude_conf,
+    group_col,
+    grace_days,
+    max_age_days
+  ) {
+    d <- as.Date(snap_date)
+
+    keep_mask <- is_duc_at(
+      dt             = wx_dt,
+      snap_date      = d,
+      min_hold_days  = min_hold_days,
+      max_hold_days  = max_hold_days,
+      recency_months = recency_months,
+      max_months_cap = max_months_cap,
+      exclude_conf   = exclude_conf,
+      grace_days     = grace_days,
+      max_age_days   = max_age_days
+    )
+
+    if (!any(keep_mask, na.rm = TRUE)) {
+      return(data.table::data.table())
+    }
+
+    out <- data.table::copy(wx_dt[keep_mask])
+
+    out[, SnapshotDate := d]
+    out[, RigReleaseDate := as.Date(RigReleaseDate)]
+    out[, SpudDate := as.Date(SpudDate)]
+    out[, DrillDoneDate := data.table::fcoalesce(RigReleaseDate, SpudDate)]
+    out[, FirstProdDate := as.Date(FirstProdDate)]
+    out[, AbandonmentDate := as.Date(AbandonmentDate)]
+    out[, CompletionDate := as.Date(CompletionDate)]
+
+    out[, DaysSinceRigRelease := as.numeric(SnapshotDate - DrillDoneDate)]
+    out[, MonthsSinceRigRelease := round(DaysSinceRigRelease / 30.4375, 1)]
+    out[, MonthsBetweenReleaseAndFirstProd := {
+      diff_days <- data.table::fifelse(
+        is.na(DrillDoneDate),
+        NA_real_,
+        data.table::fifelse(is.na(FirstProdDate), 0, pmax(0, as.numeric(FirstProdDate - DrillDoneDate)))
+      )
+      round(diff_days / 30.4375, 1)
+    }]
+
+    grp <- safe_col(out, c(group_col, "OperatorName"))
+    if (is.null(grp)) {
+      out[, Group := "(Unknown)"]
+    } else {
+      out[, Group := {
+        vals <- .SD[[1]]
+        vals <- ifelse(is.na(vals) | trimws(as.character(vals)) == "", "(Unknown)", as.character(vals))
+        vals
+      }, .SDcols = grp]
+    }
+
+    if (!"GSL_UWI" %in% names(out)) {
+      if ("GSL_UWI_Std" %in% names(out)) {
+        out[, GSL_UWI := GSL_UWI_Std]
+      } else {
+        out[, GSL_UWI := UWI]
+      }
+    }
+
+    if (!"LicensedSubstance" %in% names(out)) out[, LicensedSubstance := NA_character_]
+    if (!"LaheeUnified" %in% names(out)) {
+      out[, LaheeUnified := toupper(trimws(col_or_const(out, c("LaheeUnified", "Lahee", "LaheeClass", "LaheeClassification"))))]
+    } else {
+      out[, LaheeUnified := toupper(trimws(as.character(LaheeUnified)))]
+    }
+    if (!"CurrentStatus" %in% names(out)) out[, CurrentStatus := NA_character_]
+
+    out[, StatusNorm := tolower(trimws(as.character(CurrentStatus)))]
+    out[, CompletedBySnapshot := !is.na(CompletionDate) & CompletionDate <= SnapshotDate]
+    out[, FirstProdBySnapshot := !is.na(FirstProdDate) & FirstProdDate <= SnapshotDate]
+    out[, AbandonedBySnapshot := (!is.na(AbandonmentDate) & AbandonmentDate <= SnapshotDate) |
+         (!is.na(StatusNorm) & grepl("abd|aband", StatusNorm, perl = TRUE))]
+    out[, StatusNorm := NULL]
+    out[, FailedBecause := NA_character_]
+
+    out <- out[, .(
+      UWI,
+      GSL_UWI,
+      OperatorName,
+      ProvinceState,
+      Formation,
+      FieldName,
+      CurrentStatus,
+      is_abandoned,
+      SpudDate,
+      RigReleaseDate,
+      DrillDoneDate,
+      CompletionDate,
+      FirstProdDate,
+      AbandonmentDate,
+      LicensedSubstance,
+      LaheeUnified,
+      SnapshotDate,
+      DaysSinceRigRelease,
+      MonthsSinceRigRelease,
+      MonthsBetweenReleaseAndFirstProd,
+      CompletedBySnapshot,
+      FirstProdBySnapshot,
+      AbandonedBySnapshot,
+      FailedBecause,
+      Group
+    )]
+    out
+  }
+
+  duc_candidate_wells <- reactive({
+    req(wells_sf_global)
+    if (!inherits(wells_sf_global, "sf")) return(data.table::data.table())
+
+    dt <- data.table::as.data.table(sf::st_drop_geometry(wells_sf_global))
+
+    if (!"UWI" %in% names(dt)) dt[, UWI := NA_character_]
+    if (!"GSL_UWI" %in% names(dt)) {
+      if ("GSL_UWI_Std" %in% names(dt)) {
+        dt[, GSL_UWI := GSL_UWI_Std]
+      } else {
+        dt[, GSL_UWI := UWI]
+      }
+    }
+    for (col in c("OperatorName", "ProvinceState", "Formation", "FieldName", "ConfidentialType", "LicensedSubstance", "CurrentStatus")) {
+      if (!col %in% names(dt)) dt[, (col) := NA_character_]
+      dt[, (col) := as.character(get(col))]
+    }
+    for (col in c("SpudDate", "RigReleaseDate", "FirstProdDate", "AbandonmentDate", "CompletionDate")) {
+      if (!col %in% names(dt)) dt[, (col) := as.Date(NA)]
+      dt[, (col) := as.Date(get(col))]
+    }
+    if (!"is_abandoned" %in% names(dt)) dt[, is_abandoned := FALSE]
+    dt[is.na(is_abandoned), is_abandoned := FALSE]
+
+    lahee_vals_dt <- col_or_const(dt, c("LaheeUnified", "Lahee", "LaheeClass", "LaheeClassification"))
+    dt[, LaheeUnified := toupper(trimws(as.character(lahee_vals_dt)))]
+
+    filtered_dt <- data.table::copy(dt)
+
+    filtered_dt[, ProvinceState := toupper(trimws(as.character(ProvinceState)))]
+    filtered_dt[ProvinceState %in% c("B.C.","BC.","B C","BRITISH COLUMBIA","B.C","B C."), ProvinceState := "BC"]
+    filtered_dt[ProvinceState %in% c("ALBERTA","ALTA","AB.","AB "), ProvinceState := "AB"]
+    filtered_dt[ProvinceState %in% c("SASK","SASKATCHEWAN","SK.","SK "), ProvinceState := "SK"]
+    filtered_dt[, ProvinceState := trimws(ProvinceState)]
+
+    message("DUC DEBUG: unique ProvinceState in duc_pool AFTER normalize:")
+    print(sort(unique(filtered_dt$ProvinceState)))
+    message("DUC DEBUG: Province counts BEFORE DUC rules:")
+    print(table(filtered_dt$ProvinceState, useNA = 'ifany'))
+    message("DUC DEBUG: RigReleaseDate NA rate by Province (after fallback join):")
+    print(table(filtered_dt$ProvinceState, is.na(filtered_dt$RigReleaseDate), useNA = 'ifany'))
+    message("DUC DEBUG: ConfidentialType by Province:")
+    print(table(filtered_dt$ProvinceState, filtered_dt$ConfidentialType, useNA = 'ifany'))
+    message("DUC DEBUG: Sample BC-like rows BEFORE DUC rules:")
+    print(head(
+      filtered_dt[ProvinceState == "BC",
+                  .(UWI, ProvinceState, RigReleaseDate, FirstProdDate,
+                    AbandonmentDate, ConfidentialType, OperatorName,
+                    FieldName, Formation)],
+      20
+    ))
+
+    licensed_vals <- col_or_const(filtered_dt, c("LicensedSubstance", "LICENSED_SUBSTANCE"))
+    filtered_dt[, LicensedSubstance := trimws(as.character(licensed_vals))]
+    filtered_dt[LicensedSubstance == "", LicensedSubstance := NA_character_]
+
+    lahee_vals <- col_or_const(filtered_dt, c("LaheeUnified", "Lahee", "LaheeClass", "LaheeClassification"))
+    filtered_dt[, LaheeUnified := toupper(trimws(as.character(lahee_vals)))]
+
+    if (!is.null(input$operator_filter) && length(input$operator_filter) > 0 && "OperatorName" %in% names(filtered_dt)) {
+      sel <- input$operator_filter
+      if ("(Unknown)" %in% sel) {
+        keep_ops <- setdiff(sel, "(Unknown)")
+        filtered_dt <- filtered_dt[(is.na(OperatorName) | OperatorName == "" | OperatorName %in% keep_ops)]
+      } else {
+        filtered_dt <- filtered_dt[!is.na(OperatorName) & OperatorName %in% sel]
+      }
+    }
+
+    if (!is.null(input$formation_filter) && length(input$formation_filter) > 0 && "Formation" %in% names(filtered_dt)) {
+      filtered_dt <- filtered_dt[!is.na(Formation) & Formation %in% input$formation_filter]
+    }
+
+    if (!is.null(input$field_filter) && length(input$field_filter) > 0 && "FieldName" %in% names(filtered_dt)) {
+      filtered_dt <- filtered_dt[!is.na(FieldName) & FieldName %in% input$field_filter]
+    }
+
+    if (!is.null(input$province_filter) && length(input$province_filter) > 0 && "ProvinceState" %in% names(filtered_dt)) {
+      filtered_dt <- filtered_dt[!is.na(ProvinceState) & ProvinceState %in% input$province_filter]
+    }
+
+    if (isTRUE(input$duc_exclude_conf) && "ConfidentialType" %in% names(filtered_dt)) {
+      filtered_dt <- filtered_dt[is.na(ConfidentialType) | ConfidentialType == ""]
+    }
+
+    if (!"CompletionDate" %in% names(filtered_dt) || (all(is.na(filtered_dt$CompletionDate)) && !reactive_vals$completion_notice_shown)) {
+      showNotification("CompletionDate column missing or empty; completion gating may be skipped.", type = "message", duration = 6)
+      reactive_vals$completion_notice_shown <- TRUE
+    }
+
+    has_lahee <- any(!is.na(filtered_dt$LaheeUnified) & filtered_dt$LaheeUnified != "")
+    if (identical(input$duc_lahee_filter, "Development")) {
+      if (has_lahee) {
+        filtered_dt <- filtered_dt[LaheeUnified == "DEVELOPMENT"]
+      } else if (!isTRUE(reactive_vals$lahee_notice_shown)) {
+        showNotification("Lahee column not found in this environment; DUC counts are not filtered by Development.", type = "message", duration = 6)
+        reactive_vals$lahee_notice_shown <- TRUE
+      }
+    }
+
+    reactive_vals$duc_substance_choices <- sort(unique(filtered_dt$LicensedSubstance))
+
+    filtered_dt[, .(
+      UWI,
+      GSL_UWI,
+      OperatorName,
+      ProvinceState,
+      Formation,
+      FieldName,
+      CurrentStatus,
+      SpudDate,
+      RigReleaseDate,
+      CompletionDate,
+      FirstProdDate,
+      AbandonmentDate,
+      ConfidentialType,
+      LicensedSubstance,
+      LaheeUnified
+    )]
+  })
+
+  fetch_monthly_production_totals <- function(uwi_vec, date_start, date_end) {
+    if (length(uwi_vec) == 0) return(data.table::data.table())
+    dt <- fetch_monthly_gor(uwi_vec, date_start, date_end, use_cnd = TRUE)
+    if (is.null(dt) || !nrow(dt)) return(data.table::data.table())
+    if (!"GSL_UWI_STD" %in% names(dt)) return(data.table::data.table())
+
+    prod_dt <- data.table::copy(dt)
+    if (!"PROD_DATE" %in% names(prod_dt)) return(data.table::data.table())
+
+    prod_dt[, PROD_MONTH := lubridate::floor_date(PROD_DATE, "month")]
+    name_map <- list(
+      OilBBL = intersect(c("OilBBL", "OILBBL"), names(prod_dt)),
+      CndBBL = intersect(c("CndBBL", "CNDBBL"), names(prod_dt)),
+      GasMCF = intersect(c("GasMCF", "GASMCF"), names(prod_dt))
+    )
+    for (nm in names(name_map)) {
+      src <- setdiff(name_map[[nm]], nm)
+      if (length(src) > 0) data.table::setnames(prod_dt, old = src[1], new = nm, skip_absent = TRUE)
+    }
+    for (col in c("OilBBL", "CndBBL", "GasMCF")) {
+      if (!col %in% names(prod_dt)) prod_dt[, (col) := 0]
+      if (!is.numeric(prod_dt[[col]])) prod_dt[, (col) := as.numeric(get(col))]
+      prod_dt[is.na(get(col)), (col) := 0]
+    }
+    prod_dt[, TotalVolume := OilBBL + CndBBL + GasMCF]
+    prod_dt[, .(
+      OilBBL = sum(OilBBL, na.rm = TRUE),
+      CndBBL = sum(CndBBL, na.rm = TRUE),
+      GasMCF = sum(GasMCF, na.rm = TRUE),
+      TotalVolume = sum(TotalVolume, na.rm = TRUE)
+    ), by = .(GSL_UWI_STD, PROD_MONTH)]
   }
   
   # Initial population of pickers (non-cascading)
@@ -1410,16 +2488,40 @@ server <- function(input, output, session) {
     req(wells_sf_global, nrow(wells_sf_global) > 0)
     message("SERVER OBSERVE (Initial Picker Population & Date Slider Range): Entered observer.")
     
-    op_choices_init <- prepare_filter_choices(wells_sf_global$OperatorName, "OperatorName (initial)")
+    op_choices_init <- get_operator_choices(wells_sf_global)
     form_choices_init <- prepare_filter_choices(wells_sf_global$Formation, "Formation (initial)")
     fld_choices_init <- prepare_filter_choices(wells_sf_global$FieldName, "FieldName (initial)")
     prov_choices_init <- prepare_filter_choices(wells_sf_global$ProvinceState, "ProvinceState (initial)")
-    
-    updatePickerInput(session, "operator_filter", choices = if(length(op_choices_init)>0) op_choices_init else c("No Operators Found" = ""), selected = NULL)
-    updatePickerInput(session, "group_operator_filter", choices = if(length(op_choices_init)>0) op_choices_init else c("No Operators Found" = ""), selected = NULL)
-    updatePickerInput(session, "formation_filter", choices = if(length(form_choices_init)>0) form_choices_init else c("No Formations Found" = ""), selected = NULL)
-    updatePickerInput(session, "field_filter", choices = if(length(fld_choices_init)>0) fld_choices_init else c("No Fields Found" = ""), selected = NULL)
-    updatePickerInput(session, "province_filter", choices = if(length(prov_choices_init)>0) prov_choices_init else c("No Provinces Found" = ""), selected = NULL)
+
+    if (length(op_choices_init) == 0) {
+      showNotification("No values available for this filter under current selections.", type = "warning", duration = 5)
+      updatePickerInput(session, "operator_filter", choices = c("(Unknown)" = "(Unknown)"), selected = NULL)
+      updatePickerInput(session, "group_operator_filter", choices = c("(Unknown)" = "(Unknown)"), selected = NULL)
+    } else {
+      updatePickerInput(session, "operator_filter", choices = op_choices_init, selected = NULL)
+      updatePickerInput(session, "group_operator_filter", choices = op_choices_init, selected = NULL)
+    }
+
+    if (length(form_choices_init) == 0) {
+      showNotification("No values available for this filter under current selections.", type = "warning", duration = 5)
+      updatePickerInput(session, "formation_filter", choices = c("(Unknown)" = "(Unknown)"), selected = NULL)
+    } else {
+      updatePickerInput(session, "formation_filter", choices = form_choices_init, selected = NULL)
+    }
+
+    if (length(fld_choices_init) == 0) {
+      showNotification("No values available for this filter under current selections.", type = "warning", duration = 5)
+      updatePickerInput(session, "field_filter", choices = c("(Unknown)" = "(Unknown)"), selected = NULL)
+    } else {
+      updatePickerInput(session, "field_filter", choices = fld_choices_init, selected = NULL)
+    }
+
+    if (length(prov_choices_init) == 0) {
+      showNotification("No values available for this filter under current selections.", type = "warning", duration = 5)
+      updatePickerInput(session, "province_filter", choices = c("(Unknown)" = "(Unknown)"), selected = NULL)
+    } else {
+      updatePickerInput(session, "province_filter", choices = prov_choices_init, selected = NULL)
+    }
     
     updatePickerInput(session, "play_subplay_filter",
                       choices = if(length(initial_play_subplay_layer_names)>0) initial_play_subplay_layer_names else c("No Layers Loaded" = ""),
@@ -1567,10 +2669,22 @@ server <- function(input, output, session) {
           Operator = dplyr::coalesce(operator_monthly, Operator_cap, "(Unknown)"),
           Facility = dplyr::coalesce(FacilityName, facility_id),
           FacilityType_display = dplyr::coalesce(FacilityType_cap, facility_subtype, facility_type),
-          utilization = dplyr::if_else(!is.na(monthly_capacity_e3m3) & monthly_capacity_e3m3 > 0,
-                                       throughput_gas_e3m3 / monthly_capacity_e3m3, NA_real_),
+          monthly_throughput_e3m3 = throughput_gas_e3m3,
+          utilization = dplyr::if_else(is.finite(monthly_capacity_e3m3) & monthly_capacity_e3m3 > 0,
+                                       monthly_throughput_e3m3 / monthly_capacity_e3m3, NA_real_),
           utilization_pct = utilization * 100
         )
+      if (!"monthly_capacity_e3m3" %in% names(gasplants_joined)) {
+        gasplants_joined$monthly_capacity_e3m3 <- rep(NA_real_, nrow(gasplants_joined))
+      }
+      if (!"monthly_throughput_e3m3" %in% names(gasplants_joined)) {
+        gasplants_joined$monthly_throughput_e3m3 <- rep(0, nrow(gasplants_joined))
+      }
+      gasplants_joined$monthly_throughput_e3m3[is.na(gasplants_joined$monthly_throughput_e3m3)] <- 0
+      if ("utilization" %in% names(gasplants_joined)) {
+        gasplants_joined$utilization[!is.finite(gasplants_joined$utilization)] <- NA_real_
+      }
+      gasplants_joined$utilization_pct <- gasplants_joined$utilization * 100
       gasplants_joined$Operator <- normalize_operator_label(gasplants_joined$Operator)
       gasplants_joined$FacilityType_display <- normalize_type_label(gasplants_joined$FacilityType_display)
       gasplants_joined$Facility[is.na(gasplants_joined$Facility) | gasplants_joined$Facility == ""] <- gasplants_joined$facility_id[is.na(gasplants_joined$Facility) | gasplants_joined$Facility == ""]
@@ -1613,18 +2727,42 @@ server <- function(input, output, session) {
       
       days_in_mo <- lubridate::days_in_month(gp$month)
       daily_capacity  <- ifelse(days_in_mo > 0, gp$monthly_capacity_e3m3 / days_in_mo, NA_real_)
-      daily_through   <- ifelse(days_in_mo > 0, gp$throughput_gas_e3m3 / days_in_mo, NA_real_)
+      daily_through   <- ifelse(days_in_mo > 0, gp$monthly_throughput_e3m3 / days_in_mo, NA_real_)
       radius <- scale_capacity_radius(daily_capacity)
       size_px <- ifelse(is.finite(radius), pmax(16, round(radius * 2)), 16)
       
       gp$Operator <- normalize_operator_label(gp$Operator)
       gp$FacilityType_display <- normalize_type_label(gp$FacilityType_display)
-      
-      operators <- sort(unique(gp$Operator))
-      operator_colors <- grDevices::hcl.colors(max(length(operators), 1), palette = "Dynamic")
-      color_lookup <- stats::setNames(operator_colors, operators)
-      marker_colors <- unname(color_lookup[gp$Operator])
-      marker_colors[is.na(marker_colors)] <- "#2c3e50"
+
+      legend_pal <- NULL
+      legend_values <- NULL
+      legend_title <- NULL
+      if (identical(input$gp_color_by, "util")) {
+        pal <- util_palette(gp$utilization)
+        gp$color_val <- pal(gp$utilization)
+        legend_title <- "Utilization"
+        legend_pal <- pal
+        legend_values <- gp$utilization
+      } else {
+        op_source <- if ("operator_monthly" %in% names(gp)) gp$operator_monthly else gp$Operator
+        if (is.null(op_source)) op_source <- gp$Operator
+        op_vals <- as.character(op_source)
+        if (!is.null(op_vals)) {
+          blank <- is.na(op_vals) | trimws(op_vals) == ""
+          if (any(blank)) {
+            op_vals[blank] <- gp$Operator[blank]
+          }
+        }
+        op <- normalize_operator_label(op_vals)
+        pal <- op_palette(sort(unique(op)))
+        gp$color_val <- pal(op)
+        legend_title <- "Operator"
+        legend_pal <- pal
+        legend_values <- op
+      }
+
+      marker_colors <- gp$color_val
+      marker_colors[is.na(marker_colors) | marker_colors == ""] <- "#2c3e50"
       
       type_shapes <- assign_shape_map(gp$FacilityType_display)
       shape_assignments <- unname(type_shapes$map[as.character(gp$FacilityType_display)])
@@ -1662,13 +2800,19 @@ server <- function(input, output, session) {
         options = leaflet::markerOptions(riseOnHover = TRUE)
       )
       
-      proxy <- proxy %>% addLegend(
-        position = "bottomright",
-        colors = operator_colors,
-        labels = operators,
-        title = "Operator",
-        opacity = 0.9
-      )
+      proxy <- proxy %>%
+        {
+          if (identical(input$gp_color_by, "util") && !is.null(legend_pal)) {
+            leaflet::addLegend(., position = "bottomright", pal = legend_pal, values = legend_values,
+                               title = legend_title, opacity = 0.9,
+                               labFormat = leaflet::labelFormat(digits = 0, suffix = "x"))
+          } else if (!is.null(legend_pal)) {
+            leaflet::addLegend(., position = "bottomright", pal = legend_pal, values = legend_values,
+                               title = legend_title, opacity = 0.9)
+          } else {
+            .
+          }
+        }
       
       shape_legend <- build_shape_legend(type_shapes$map)
       if (!is.null(shape_legend)) {
@@ -1681,7 +2825,7 @@ server <- function(input, output, session) {
       if (is.null(gp) || !nrow(gp)) return(DT::datatable(data.frame()))
       days_in_mo <- lubridate::days_in_month(gp$month)
       daily_capacity <- ifelse(days_in_mo > 0, gp$monthly_capacity_e3m3 / days_in_mo, NA_real_)
-      daily_through  <- ifelse(days_in_mo > 0, gp$throughput_gas_e3m3 / days_in_mo, NA_real_)
+      daily_through  <- ifelse(days_in_mo > 0, gp$monthly_throughput_e3m3 / days_in_mo, NA_real_)
       df <- tibble::tibble(
         Month = format(gp$month, "%Y-%m"),
         FacilityID = gp$facility_id,
@@ -1710,6 +2854,11 @@ server <- function(input, output, session) {
     updatePickerInput(session, "product_type_filter_analysis", selected = c("OIL", "CND", "GAS", "BOE"))
     updateCheckboxInput(session, "gor_include_cnd", value = TRUE)
     updateSliderInput(session, "gor_range", value = c(0, 50000))
+    updateSelectizeInput(session, "duc_substance_filter",
+                         choices = reactive_vals$duc_substance_choices %||% character(0),
+                         selected = character(0),
+                         server = TRUE)
+    updateCheckboxInput(session, "duc_include_unknown_substance", value = TRUE)
 
     default_start_date_reset <- max(reactive_vals$min_first_prod_date_overall, reactive_vals$max_first_prod_date_overall - years(10), na.rm = TRUE)
     if (!is.finite(default_start_date_reset)) default_start_date_reset <- Sys.Date() - years(10)
@@ -1722,9 +2871,10 @@ server <- function(input, output, session) {
     reactive_vals$map_df_with_gor <- sf::st_sf(geometry=sf::st_sfc(), crs=4326)
     reactive_vals$has_map_been_updated_once <- FALSE
     reactive_vals$current_selected_gsl_uwi_std <- NULL
-    updateSelectInput(session, "selected_well_for_prod",
-                      choices = c("Apply filters and click a well on map or select here" = ""),
-                      selected = "")
+    updateSelectizeInput(session, "selected_well_for_prod",
+                         choices = c("Apply filters and click a well on map or select here" = ""),
+                         selected = character(0),
+                         server = TRUE)
     showNotification("Filters reset. Apply filters to display wells.", type = "warning", duration=3, id="resetCompleteNotify")
   })
   
@@ -1761,45 +2911,55 @@ server <- function(input, output, session) {
       showNotification("Well data source is not available.", type="error", duration=3)
       return()
     }
-    df <- wells_sf
-    if (nrow(df) == 0) {
-      reactive_vals$wells_to_display <- sf::st_sf(geometry = sf::st_sfc(), crs = 4326)
-      reactive_vals$wells_filtered_base <- sf::st_sf(geometry = sf::st_sfc(), crs = 4326)
-      reactive_vals$map_df_with_gor <- sf::st_sf(geometry = sf::st_sfc(), crs = 4326)
-      reactive_vals$has_map_been_updated_once <- TRUE
-      removeNotification("mapUpdateMsg")
-      showNotification("No well data available to filter.", type="warning", duration=3)
-      return()
-    }
-    current_operator_filter <- input$operator_filter[!input$operator_filter %in% c("", "Loading...", "No Operators Found", "No Well Data")]
-    current_formation_filter <- input$formation_filter[!input$formation_filter %in% c("", "Loading...", "No Formations Found", "No Well Data")]
-    current_field_filter <- input$field_filter[!input$field_filter %in% c("", "Loading...", "No Fields Found", "No Well Data")]
-    current_province_filter <- input$province_filter[!input$province_filter %in% c("", "Loading...", "No Provinces Found", "No Well Data")]
-    
-    current_date_filter_start <- input$well_date_filter[1]
-    current_date_filter_end <- input$well_date_filter[2]
-    
-    if (length(current_operator_filter) > 0) {
-      if ("OperatorName" %in% names(df)) df <- df %>% filter(OperatorName %in% current_operator_filter)
-    }
-    if (length(current_formation_filter) > 0) {
-      if ("Formation" %in% names(df)) df <- df %>% filter(Formation %in% current_formation_filter)
-    }
-    if (length(current_field_filter) > 0) {
-      if ("FieldName" %in% names(df)) df <- df %>% filter(FieldName %in% current_field_filter)
-    }
-    if (length(current_province_filter) > 0) {
-      if ("ProvinceState" %in% names(df)) df <- df %>% filter(ProvinceState %in% current_province_filter)
-    }
-    if ("FirstProdDate" %in% names(df) && inherits(df$FirstProdDate, "Date")) {
-      if (!is.na(current_date_filter_start) && !is.na(current_date_filter_end)) {
-        df <- df %>% filter(FirstProdDate >= current_date_filter_start & FirstProdDate <= current_date_filter_end)
+    df <- wells_sf_global
+
+    # Operator
+    if (!is.null(input$operator_filter) && length(input$operator_filter) > 0 && "OperatorName" %in% names(df)) {
+      if ("(Unknown)" %in% input$operator_filter) {
+        df <- df %>% dplyr::filter(is.na(OperatorName) | OperatorName == "" | OperatorName %in% setdiff(input$operator_filter, "(Unknown)"))
       } else {
-        message("Date filter not applied as start or end date is NA.")
+        df <- df %>% dplyr::filter(!is.na(OperatorName) & OperatorName %in% input$operator_filter)
       }
-    } else {
-      message("FirstProdDate column not found or not Date type, skipping date filter.")
     }
+
+    # Formation
+    if (!is.null(input$formation_filter) && length(input$formation_filter) > 0 && "Formation" %in% names(df)) {
+      df <- df %>% dplyr::filter(!is.na(Formation) & Formation %in% input$formation_filter)
+    }
+
+    # Field
+    if (!is.null(input$field_filter) && length(input$field_filter) > 0 && "FieldName" %in% names(df)) {
+      df <- df %>% dplyr::filter(!is.na(FieldName) & FieldName %in% input$field_filter)
+    }
+
+    # Province/State
+    if (!is.null(input$province_filter) && length(input$province_filter) > 0 && "ProvinceState" %in% names(df)) {
+      df <- df %>% dplyr::filter(!is.na(ProvinceState) & ProvinceState %in% input$province_filter)
+    }
+
+    # Date range (FirstProdDate)
+    if (!is.null(input$well_date_filter) && length(input$well_date_filter) == 2 && "FirstProdDate" %in% names(df)) {
+      df <- df %>% dplyr::filter(!is.na(FirstProdDate) &
+                                  FirstProdDate >= as.Date(input$well_date_filter[1]) &
+                                  FirstProdDate <= as.Date(input$well_date_filter[2]))
+    }
+
+    if (nrow(df) == 0) {
+      reactive_vals$wells_to_display <- df
+      reactive_vals$wells_filtered_base <- df
+      reactive_vals$map_df_with_gor <- df
+      reactive_vals$has_map_been_updated_once <- TRUE
+      leafletProxy("well_map") %>%
+        clearMarkers() %>%
+        clearMarkerClusters() %>%
+        clearShapes() %>%
+        clearControls()
+      removeNotification("mapUpdateMsg")
+      showNotification("No values available for this filter under current selections.", type = "warning", duration = 5)
+      update_well_selection_choices(df)
+      return(invisible(NULL))
+    }
+
     reactive_vals$wells_filtered_base <- df
     df_with_gor <- compute_map_with_gor(df)
     reactive_vals$wells_to_display <- df_with_gor
@@ -1827,6 +2987,10 @@ server <- function(input, output, session) {
     }
     displayed_wells <- reactive_vals$wells_to_display
     total_count <- nrow(displayed_wells)
+
+    if (total_count == 0) {
+      return(HTML("0 wells match the current filters."))
+    }
     
     confidential_count <- 0
     if ("ConfidentialType" %in% names(displayed_wells) && total_count > 0) {
@@ -1955,73 +3119,130 @@ server <- function(input, output, session) {
     # Well Markers (Surface Points) and Well Sticks (Polylines)
     if (!is.null(df_map) && inherits(df_map, "sf") && nrow(df_map) > 0) {
 
-      capd <- cap_gor_for_plot(df_map$GOR_Latest)
-      gor_for_color <- capd$vals
-      pal_gor <- safe_gor_palette(gor_for_color, n = 7)
-      color_mask <- is.finite(gor_for_color)
-      color_mask[is.na(color_mask)] <- FALSE
-      df_map$GOR_Color <- rep("#9E9E9E", nrow(df_map))
-      if (any(color_mask)) {
-        df_map$GOR_Color[color_mask] <- pal_gor(gor_for_color[color_mask])
+      color_metric <- input$well_color_metric %||% "gas_weight"
+
+      gas_weight_pct <- if ("GasWeightingLatest" %in% names(df_map)) {
+        as.numeric(df_map$GasWeightingLatest) * 100
+      } else {
+        rep(NA_real_, nrow(df_map))
       }
+      gas_weight_pct[!is.finite(gas_weight_pct)] <- NA_real_
+      gas_weight_pct <- pmax(pmin(gas_weight_pct, 100), 0)
+
+      gor_cap <- cap_gor_for_plot(df_map$GOR_Latest)
+      gor_for_color <- gor_cap$vals
+      gor_for_color[!is.finite(gor_for_color) | gor_for_color < 0] <- NA_real_
+
+      color_vec <- rep("#9E9E9E", nrow(df_map))
+      legend_pal <- NULL
+      legend_values <- numeric(0)
+      legend_title <- NULL
+      legend_formatter <- NULL
+
+      if (identical(color_metric, "gas_weight")) {
+        finite_weight <- is.finite(gas_weight_pct)
+        domain <- range(gas_weight_pct[finite_weight], na.rm = TRUE)
+        if (!all(is.finite(domain))) {
+          domain <- c(0, 100)
+        }
+        if (diff(domain) < 1e-6) {
+          domain <- domain + c(-0.5, 0.5)
+        }
+        pal_weight <- leaflet::colorNumeric(
+          palette = "viridis",
+          domain = domain,
+          na.color = "#9E9E9E"
+        )
+        color_vec <- pal_weight(gas_weight_pct)
+        legend_pal <- pal_weight
+        legend_values <- gas_weight_pct[finite_weight]
+        legend_title <- "Gas weighting (%)"
+        legend_formatter <- leaflet::labelFormat(suffix = "%", digits = 0)
+      } else {
+        pal_gor <- make_gor_palette(gor_for_color, n = 7)
+        finite_mask <- is.finite(gor_for_color) & gor_for_color >= 0
+        if (any(finite_mask)) {
+          color_vec[finite_mask] <- pal_gor(gor_for_color[finite_mask])
+        }
+        legend_pal <- pal_gor
+        legend_values <- gor_for_color[finite_mask]
+        legend_title <- "GOR (MCF/BBL)"
+        legend_formatter <- NULL
+      }
+
+      df_map$Well_Color <- color_vec
       df_map$GOR_Capped_ForColor <- gor_for_color
 
-      well_layer_id_col_name <- if (!"GSL_UWI_Std" %in% names(df_map) || !is.character(df_map$GSL_UWI_Std)) {
-        df_map$GSL_UWI_Std_for_map <- paste0("wellmarker_", seq_len(nrow(df_map)))
+      has_surface_lon <- "SurfaceLongitude" %in% names(df_map)
+      has_surface_lat <- "SurfaceLatitude" %in% names(df_map)
+      lon_vals <- if (has_surface_lon) suppressWarnings(as.numeric(df_map$SurfaceLongitude)) else rep(NA_real_, nrow(df_map))
+      lat_vals <- if (has_surface_lat) suppressWarnings(as.numeric(df_map$SurfaceLatitude)) else rep(NA_real_, nrow(df_map))
+
+      valid_coords <- !is.na(lon_vals) & !is.na(lat_vals) &
+        is.finite(lon_vals) & is.finite(lat_vals)
+
+      if (!any(valid_coords)) {
+        message("[MAP] No wells with valid surface coordinates after filtering; map markers skipped.")
+      }
+
+      df_map_valid <- df_map[valid_coords, , drop = FALSE]
+      lon_valid <- lon_vals[valid_coords]
+      lat_valid <- lat_vals[valid_coords]
+
+      well_layer_id_col_name <- if (!"GSL_UWI_Std" %in% names(df_map_valid) || !is.character(df_map_valid$GSL_UWI_Std)) {
+        df_map_valid$GSL_UWI_Std_for_map <- paste0("wellmarker_", seq_len(nrow(df_map_valid)))
         "GSL_UWI_Std_for_map"
       } else { "GSL_UWI_Std" }
 
       base_popup <- paste0(
-        "<b>UWI:</b> ", htmltools::htmlEscape(df_map$UWI), "<br>",
-        "<b>Well Name:</b> ", htmltools::htmlEscape(df_map$WellName), "<br>",
-        "<b>Operator:</b> ", htmltools::htmlEscape(df_map$OperatorName), "<br>",
-        "<b>Formation:</b> ", htmltools::htmlEscape(df_map$Formation), "<br>",
-        "<b>Field:</b> ", htmltools::htmlEscape(df_map$FieldName), "<br>",
-        "<b>Status:</b> ", htmltools::htmlEscape(df_map$CurrentStatus), "<br>",
-        "<b>First Prod Date:</b> ", htmltools::htmlEscape(as.character(df_map$FirstProdDate))
+        "<b>UWI:</b> ", htmltools::htmlEscape(df_map_valid$UWI), "<br>",
+        "<b>Well Name:</b> ", htmltools::htmlEscape(df_map_valid$WellName), "<br>",
+        "<b>Operator:</b> ", htmltools::htmlEscape(df_map_valid$OperatorName), "<br>",
+        "<b>Formation:</b> ", htmltools::htmlEscape(df_map_valid$Formation), "<br>",
+        "<b>Field:</b> ", htmltools::htmlEscape(df_map_valid$FieldName), "<br>",
+        "<b>Status:</b> ", htmltools::htmlEscape(df_map_valid$CurrentStatus), "<br>",
+        "<b>First Prod Date:</b> ", htmltools::htmlEscape(as.character(df_map_valid$FirstProdDate))
       )
 
-      confidential_text_vec <- if ("ConfidentialType" %in% names(df_map)) {
-        ifelse(!is.na(df_map$ConfidentialType),
-               paste0("<br><b>Confidential:</b> ", htmltools::htmlEscape(df_map$ConfidentialType)),
+      confidential_text_vec <- if ("ConfidentialType" %in% names(df_map_valid)) {
+        ifelse(!is.na(df_map_valid$ConfidentialType),
+               paste0("<br><b>Confidential:</b> ", htmltools::htmlEscape(df_map_valid$ConfidentialType)),
                "")
-      } else { rep("", nrow(df_map)) }
+      } else { rep("", nrow(df_map_valid)) }
 
-      bh_lat_text_vec <- if ("BH_Latitude" %in% names(df_map)) {
-        ifelse(!is.na(df_map$BH_Latitude),
-               paste0("<br><b>BH Lat:</b> ", round(df_map$BH_Latitude, 5)),
+      bh_lat_text_vec <- if ("BH_Latitude" %in% names(df_map_valid)) {
+        ifelse(!is.na(df_map_valid$BH_Latitude),
+               paste0("<br><b>BH Lat:</b> ", round(df_map_valid$BH_Latitude, 5)),
                "")
-      } else { rep("", nrow(df_map)) }
+      } else { rep("", nrow(df_map_valid)) }
 
-      bh_lon_text_vec <- if ("BH_Longitude" %in% names(df_map)) {
-        ifelse(!is.na(df_map$BH_Longitude),
-               paste0("<br><b>BH Lon:</b> ", round(df_map$BH_Longitude, 5)),
+      bh_lon_text_vec <- if ("BH_Longitude" %in% names(df_map_valid)) {
+        ifelse(!is.na(df_map_valid$BH_Longitude),
+               paste0("<br><b>BH Lon:</b> ", round(df_map_valid$BH_Longitude, 5)),
                "")
-      } else { rep("", nrow(df_map)) }
+      } else { rep("", nrow(df_map_valid)) }
 
-      is_inf_vec <- is.infinite(df_map$GOR_Latest)
-      gor_value_text <- ifelse(is_inf_vec,
-                               "100% gas (∞ GOR)",
-                               ifelse(is.finite(df_map$GOR_Latest),
-                                      paste0(scales::comma(round(df_map$GOR_Latest, 1)), " MCF/BBL"),
-                                      "NA"))
-      gor_month_text <- ifelse(!is.na(df_map$GOR_Latest_Month),
-                               format(df_map$GOR_Latest_Month, "%Y-%m"),
+      finite_gor_latest <- is.finite(df_map_valid$GOR_Latest) & df_map_valid$GOR_Latest >= 0
+      gor_value_text <- ifelse(finite_gor_latest,
+                               paste0(scales::comma(round(df_map_valid$GOR_Latest, 1)), " MCF/BBL"),
+                               "NA")
+      gor_month_text <- ifelse(!is.na(df_map_valid$GOR_Latest_Month),
+                               format(df_map_valid$GOR_Latest_Month, "%Y-%m"),
                                "—")
-      gas_text <- ifelse(!is.na(df_map$MonthlyGasMCF),
-                         scales::comma(round(df_map$MonthlyGasMCF, 0)),
+      gas_text <- ifelse(!is.na(df_map_valid$MonthlyGasMCF),
+                         scales::comma(round(df_map_valid$MonthlyGasMCF, 0)),
                          "NA")
-      oil_text <- ifelse(!is.na(df_map$MonthlyOilBBL),
-                         scales::comma(round(df_map$MonthlyOilBBL, 0)),
+      oil_text <- ifelse(!is.na(df_map_valid$MonthlyOilBBL),
+                         scales::comma(round(df_map_valid$MonthlyOilBBL, 0)),
                          "NA")
-      cnd_text <- ifelse(!is.na(df_map$MonthlyCndBBL),
-                         scales::comma(round(df_map$MonthlyCndBBL, 0)),
+      cnd_text <- ifelse(!is.na(df_map_valid$MonthlyCndBBL),
+                         scales::comma(round(df_map_valid$MonthlyCndBBL, 0)),
                          "NA")
-      liquids_text <- ifelse(!is.na(df_map$MonthlyLiquidsBBL),
-                             scales::comma(round(df_map$MonthlyLiquidsBBL, 0)),
+      liquids_text <- ifelse(!is.na(df_map_valid$MonthlyLiquidsBBL),
+                             scales::comma(round(df_map_valid$MonthlyLiquidsBBL, 0)),
                              "NA")
-      gas_weighting_text <- ifelse(!is.na(df_map$GasWeightingLatest),
-                                   scales::percent(df_map$GasWeightingLatest, accuracy = 0.1),
+      gas_weighting_text <- ifelse(!is.na(df_map_valid$GasWeightingLatest),
+                                   scales::percent(df_map_valid$GasWeightingLatest, accuracy = 0.1),
                                    "NA")
       cnd_line <- if (isTRUE(input$gor_include_cnd)) paste0("<br><b>Monthly Condensate (BBL):</b> ", cnd_text) else ""
       gor_popup <- paste0(
@@ -2036,30 +3257,33 @@ server <- function(input, output, session) {
 
       well_popup_content <- paste0(base_popup, confidential_text_vec, bh_lat_text_vec, bh_lon_text_vec, gor_popup)
 
-      proxy %>% addCircleMarkers(
-        lng = df_map$SurfaceLongitude,
-        lat = df_map$SurfaceLatitude,
-        radius = 6,
-        color = df_map$GOR_Color,
-        fillColor = df_map$GOR_Color,
-        stroke = FALSE,
-        fillOpacity = 0.85,
-        popup = lapply(well_popup_content, htmltools::HTML),
-        layerId = df_map[[well_layer_id_col_name]],
-        group = "Wells",
-        clusterOptions = markerClusterOptions(spiderfyOnMaxZoom = TRUE, showCoverageOnHover = TRUE, zoomToBoundsOnClick = TRUE)
-      )
+      if (nrow(df_map_valid) > 0) {
+        proxy %>% addCircleMarkers(
+          lng = lon_valid,
+          lat = lat_valid,
+          radius = 6,
+          color = df_map_valid$Well_Color,
+          fillColor = df_map_valid$Well_Color,
+          stroke = FALSE,
+          fillOpacity = 0.85,
+          popup = lapply(well_popup_content, htmltools::HTML),
+          layerId = df_map_valid[[well_layer_id_col_name]],
+          group = "Wells",
+          clusterOptions = markerClusterOptions(spiderfyOnMaxZoom = TRUE, showCoverageOnHover = TRUE, zoomToBoundsOnClick = TRUE)
+        )
+      }
 
-      wells_with_bh <- df_map[!is.na(df_map$BH_Latitude) & !is.na(df_map$BH_Longitude) &
-                                !is.na(df_map$SurfaceLatitude) & !is.na(df_map$SurfaceLongitude), ]
+      bh_lon_vals <- if ("BH_Longitude" %in% names(df_map_valid)) suppressWarnings(as.numeric(df_map_valid$BH_Longitude)) else rep(NA_real_, nrow(df_map_valid))
+      bh_lat_vals <- if ("BH_Latitude" %in% names(df_map_valid)) suppressWarnings(as.numeric(df_map_valid$BH_Latitude)) else rep(NA_real_, nrow(df_map_valid))
+      wells_with_bh_idx <- which(!is.na(bh_lat_vals) & !is.na(bh_lon_vals) & is.finite(bh_lat_vals) & is.finite(bh_lon_vals))
 
-      if (nrow(wells_with_bh) > 0) {
-        for (i in seq_len(nrow(wells_with_bh))) {
-          well_stick_data <- wells_with_bh[i, ]
-          stick_color <- if (!is.null(well_stick_data$GOR_Color) && !is.na(well_stick_data$GOR_Color)) well_stick_data$GOR_Color else "#9E9E9E"
+      if (length(wells_with_bh_idx) > 0) {
+        for (idx in wells_with_bh_idx) {
+          well_stick_data <- df_map_valid[idx, ]
+          stick_color <- if (!is.null(well_stick_data$Well_Color) && !is.na(well_stick_data$Well_Color)) well_stick_data$Well_Color else "#9E9E9E"
           proxy %>% addPolylines(
-            lng = c(well_stick_data$SurfaceLongitude, well_stick_data$BH_Longitude),
-            lat = c(well_stick_data$SurfaceLatitude, well_stick_data$BH_Latitude),
+            lng = c(lon_valid[idx], bh_lon_vals[idx]),
+            lat = c(lat_valid[idx], bh_lat_vals[idx]),
             layerId = paste0(well_stick_data[[well_layer_id_col_name]], "_stick"),
             color = stick_color,
             weight = 2,
@@ -2069,21 +3293,20 @@ server <- function(input, output, session) {
         }
       }
 
-      dom <- gor_for_color[is.finite(gor_for_color)]
-      if (!length(dom)) {
-        message("[GOR] No finite domain for legend; skipping legend.")
-      } else {
+      if (!is.null(legend_pal) && length(legend_values) > 0) {
         proxy %>% addLegend(
           position = "bottomright",
-          pal = pal_gor,
-          values = dom,
-          title = htmltools::HTML("GOR (MCF/BBL)<br/><span style='font-weight:400'>(∞ shown at cap)</span>"),
+          pal = legend_pal,
+          values = legend_values,
+          title = htmltools::HTML(legend_title),
           opacity = 0.9,
+          labFormat = legend_formatter,
           layerId = "gor_legend"
         )
+      } else {
+        message("[GOR] No finite domain for legend; skipping legend.")
       }
     }
-    
     # Add Acreage Legend if any acreage layers are selected
     if (length(acreage_legend_labels) > 0) {
       proxy %>% addLegend(
@@ -2109,7 +3332,7 @@ server <- function(input, output, session) {
     if ("GSL_UWI_Std" %in% names(reactive_vals$wells_to_display) &&
         cleaned_event_id %in% reactive_vals$wells_to_display$GSL_UWI_Std) {
       reactive_vals$current_selected_gsl_uwi_std <- cleaned_event_id
-      updateSelectInput(session, "selected_well_for_prod", selected = cleaned_event_id)
+      updateSelectizeInput(session, "selected_well_for_prod", selected = cleaned_event_id, server = TRUE)
       showNotification(paste("Selected well ID:", cleaned_event_id, "for production analysis."), type="message", duration=4, id="wellSelectNotify")
     } else {
       message(paste("Map click ID not directly matched to a GSL_UWI_Std:", event$id))
@@ -2117,11 +3340,17 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$selected_well_for_prod, {
-    selected_dropdown_uwi <- input$selected_well_for_prod
-    if (!is.null(selected_dropdown_uwi) && selected_dropdown_uwi != "" &&
-        (is.null(reactive_vals$current_selected_gsl_uwi_std) || selected_dropdown_uwi != reactive_vals$current_selected_gsl_uwi_std) ) {
+    selected_values <- input$selected_well_for_prod
+    selected_dropdown_uwi <- character(0)
+    if (!is.null(selected_values) && length(selected_values) > 0) {
+      selected_dropdown_uwi <- selected_values[selected_values != ""]
+    }
+    selected_dropdown_uwi <- if (length(selected_dropdown_uwi) > 0) selected_dropdown_uwi[1] else ""
+
+    if (nzchar(selected_dropdown_uwi) &&
+        (is.null(reactive_vals$current_selected_gsl_uwi_std) || selected_dropdown_uwi != reactive_vals$current_selected_gsl_uwi_std)) {
       reactive_vals$current_selected_gsl_uwi_std <- selected_dropdown_uwi
-    } else if (is.null(selected_dropdown_uwi) || selected_dropdown_uwi == "") {
+    } else if (!nzchar(selected_dropdown_uwi)) {
       if (!is.null(reactive_vals$current_selected_gsl_uwi_std)) {
         reactive_vals$current_selected_gsl_uwi_std <- NULL
       }
@@ -2585,23 +3814,38 @@ server <- function(input, output, session) {
   )
   
   gor_data_filtered <- reactive({
-    req(input$well_date_filter)
+    req(input$gor_calendar_range, input$gor_firstprod_years)
     wells_current <- reactive_vals$wells_to_display
     if (is.null(wells_current) || nrow(wells_current) == 0) return(data.table::data.table())
 
     wells_dt <- data.table::as.data.table(sf::st_drop_geometry(wells_current))
     if (!"GSL_UWI_Std" %in% names(wells_dt)) return(data.table::data.table())
 
+    if (!"FirstProdDate" %in% names(wells_dt)) {
+      wells_dt[, FirstProdDate := as.Date(NA)]
+    } else if (!inherits(wells_dt$FirstProdDate, "Date")) {
+      wells_dt[, FirstProdDate := as.Date(FirstProdDate)]
+    }
+
+    wells_dt[, FirstProdYear := ifelse(!is.na(FirstProdDate), lubridate::year(FirstProdDate), NA_integer_)]
+    fp_range <- as.integer(input$gor_firstprod_years)
+    wells_dt <- wells_dt[!is.na(FirstProdYear) & FirstProdYear >= fp_range[1] & FirstProdYear <= fp_range[2]]
+    if (!nrow(wells_dt)) return(data.table::data.table())
+
     uwis <- unique(stats::na.omit(wells_dt$GSL_UWI_Std))
     if (!length(uwis)) return(data.table::data.table())
 
-    date_vals <- input$well_date_filter
-    date_start <- if (length(date_vals) >= 1) date_vals[1] else Sys.Date() - years(5)
-    date_end <- if (length(date_vals) >= 2) date_vals[2] else Sys.Date()
-    include_cnd <- isTRUE(input$gor_include_cnd)
+    cal_range <- as.Date(input$gor_calendar_range)
+    if (length(cal_range) != 2 || any(is.na(cal_range))) return(data.table::data.table())
+    date_start <- min(cal_range)
+    date_end <- max(cal_range)
 
-    ts_dt <- compute_gor_timeseries_for_wells(uwis, date_start, date_end, include_cnd)
-    if (nrow(ts_dt) == 0) return(ts_dt)
+    ts_dt <- compute_gor_timeseries_for_wells(uwis, date_start, date_end, use_cnd = use_cnd_reactive())
+    if (nrow(ts_dt) == 0) return(data.table::data.table())
+
+    ts_dt[, PROD_DATE := as.Date(PROD_DATE)]
+    ts_dt <- ts_dt[PROD_DATE >= date_start & PROD_DATE <= date_end]
+    if (!nrow(ts_dt)) return(data.table::data.table())
 
     data.table::setorder(ts_dt, GSL_UWI_STD, PROD_DATE)
 
@@ -2610,177 +3854,156 @@ server <- function(input, output, session) {
       names(wells_dt)
     )
     wells_meta <- unique(wells_dt[, ..meta_cols])
-    if ("FirstProdDate" %in% names(wells_meta) && !inherits(wells_meta$FirstProdDate, "Date")) {
-      wells_meta[, FirstProdDate := as.Date(FirstProdDate)]
-    }
     char_cols <- setdiff(names(wells_meta), c("GSL_UWI_Std", "FirstProdDate"))
     if (length(char_cols)) {
-      wells_meta[, (char_cols) := lapply(.SD, function(x) as.character(x)), .SDcols = char_cols]
+      wells_meta[, (char_cols) := lapply(.SD, as.character), .SDcols = char_cols]
     }
 
     ts_dt <- merge(ts_dt, wells_meta, by.x = "GSL_UWI_STD", by.y = "GSL_UWI_Std", all.x = TRUE)
-
-    ts_dt[, TotalProd := GasMCF + LiquidsBBL]
-    ts_dt[, FirstProdMonthSeries := {
-      idx <- which(TotalProd > 0)
-      if (length(idx)) PROD_DATE[idx[1]] else as.Date(NA)
-    }, by = GSL_UWI_STD]
-    ts_dt[, MonthOnProduction := {
-      idx <- which(TotalProd > 0)
-      out <- rep(NA_integer_, .N)
-      if (length(idx)) {
-        start <- idx[1]
-        out[start:.N] <- seq_len(.N - start + 1)
-      }
-      out
-    }, by = GSL_UWI_STD]
-    ts_dt[, YearOnProduction := ifelse(
-      is.na(FirstProdMonthSeries),
-      NA_integer_,
-      as.integer(floor(as.numeric(difftime(PROD_DATE, FirstProdMonthSeries, units = "days")) / 365.25)) + 1
-    )]
-
-    if ("FirstProdDate" %in% names(ts_dt)) {
-      ts_dt[, VintageYear := ifelse(!is.na(FirstProdDate), lubridate::year(FirstProdDate), lubridate::year(FirstProdMonthSeries))]
-    } else {
-      ts_dt[, VintageYear := lubridate::year(FirstProdMonthSeries)]
+    if (!"LiquidsBBL" %in% names(ts_dt)) {
+      ts_dt[, LiquidsBBL := OilBBL + CndBBL]
     }
+    ts_dt[, LiquidsForGOR := suppressWarnings(as.numeric(LiquidsBBL))]
+    trim_group_col <- input$gor_group_by %||% "OperatorName"
+    if (!trim_group_col %in% names(ts_dt)) {
+      ts_dt[, (trim_group_col) := NA_character_]
+    }
+    if (isTRUE(input$trim_outliers)) {
+      ts_dt <- ts_dt[is.na(LiquidsForGOR) | LiquidsForGOR >= 5]
+      ts_dt[, TrimGroup := {
+        vals <- get(trim_group_col)
+        ifelse(is.na(vals) | trimws(as.character(vals)) == "", "(Unknown)", as.character(vals))
+      }]
+      trim_stats <- ts_dt[is.finite(GOR_MCF_PER_BBL) & GOR_MCF_PER_BBL >= 0,
+                          .(p1 = stats::quantile(GOR_MCF_PER_BBL, 0.01, na.rm = TRUE, names = FALSE),
+                            p99 = stats::quantile(GOR_MCF_PER_BBL, 0.99, na.rm = TRUE, names = FALSE)),
+                          by = TrimGroup]
+      if (nrow(trim_stats)) {
+        ts_dt <- merge(ts_dt, trim_stats, by = "TrimGroup", all.x = TRUE, sort = FALSE)
+        ts_dt[is.finite(GOR_MCF_PER_BBL) & !is.na(p1) & GOR_MCF_PER_BBL < p1, GOR_MCF_PER_BBL := p1]
+        ts_dt[is.finite(GOR_MCF_PER_BBL) & !is.na(p99) & GOR_MCF_PER_BBL > p99, GOR_MCF_PER_BBL := p99]
+        ts_dt[, c("p1", "p99") := NULL]
+      }
+      ts_dt[, TrimGroup := NULL]
+    }
+    ts_dt[, CalendarMonth := lubridate::floor_date(PROD_DATE, "month")]
+    ts_dt[, GasWeighting := if ("GasWeighting" %in% names(ts_dt)) GasWeighting else NA_real_]
+    ts_dt[, LiquidsForGOR := NULL]
+    ts_dt[, GasWeightPct := ifelse(is.finite(GasWeighting), GasWeighting * 100, NA_real_)]
 
-    ts_dt[, `:=`(TotalProd = NULL, FirstProdMonthSeries = NULL)]
     ts_dt
   })
 
-  output$gor_trend_by_month_plot <- renderPlot({
-    gor_dt <- gor_data_filtered()
-    validate(need(!is.null(gor_dt) && nrow(gor_dt) > 0, "No wells in current filter."))
+  gor_grouped_series <- reactive({
+    dt <- gor_data_filtered()
+    if (is.null(dt) || !nrow(dt)) return(data.table::data.table())
 
-    plot_dt <- gor_dt[!is.na(MonthOnProduction) & MonthOnProduction >= 1]
-    validate(need(nrow(plot_dt) > 0, "No production months available for GOR trend."))
-
-    capd <- cap_gor_for_plot(plot_dt$GOR_MCF_PER_BBL)
-    plot_dt[, GOR_for_plot := capd$vals]
-
-    if ("Formation" %in% names(plot_dt) && any(!is.na(plot_dt$Formation) & trimws(plot_dt$Formation) != "")) {
-      plot_dt[, Group := ifelse(is.na(Formation) | trimws(Formation) == "", "(Unknown)", Formation)]
-      color_label <- "Formation"
-    } else if ("OperatorName" %in% names(plot_dt) && any(!is.na(plot_dt$OperatorName) & trimws(plot_dt$OperatorName) != "")) {
-      plot_dt[, Group := ifelse(is.na(OperatorName) | trimws(OperatorName) == "", "(Unknown)", OperatorName)]
-      color_label <- "Operator"
-    } else {
-      plot_dt[, Group := "All Wells"]
-      color_label <- "Group"
+    group_col <- input$gor_group_by %||% "OperatorName"
+    if (!group_col %in% names(dt)) {
+      dt[, (group_col) := NA_character_]
     }
 
-    agg <- plot_dt[, .(
-      MedianGOR = if (all(is.na(GOR_for_plot))) NA_real_ else stats::median(GOR_for_plot, na.rm = TRUE)
-    ), by = .(Group, MonthOnProduction)]
-    agg <- agg[is.finite(MedianGOR)]
-    validate(need(nrow(agg) > 0, "No valid GOR data to plot."))
+    dt[, Group := {
+      vals <- get(group_col)
+      vals <- ifelse(is.na(vals) | trimws(as.character(vals)) == "", "(Unknown)", as.character(vals))
+      vals
+    }]
 
-    unique_groups <- unique(agg$Group)
-    group_colors <- custom_palette[1:min(length(unique_groups), length(custom_palette))]
-    if (length(unique_groups) > length(custom_palette)) {
-      group_colors <- rep(custom_palette, length.out = length(unique_groups))
-    }
-    names(group_colors) <- unique_groups
+    dt[, CalendarMonth := as.Date(CalendarMonth)]
+    dt <- dt[!is.na(CalendarMonth)]
 
-    ggplot(agg, aes(x = MonthOnProduction, y = MedianGOR, color = Group, group = Group)) +
-      geom_line(linewidth = 1.1) +
-      scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
-      scale_y_continuous(labels = scales::comma) +
-      scale_color_manual(values = group_colors) +
-      labs(
-        title = "Median GOR by month on production",
-        subtitle = "∞ shown at cap",
-        x = "Month on Production",
-        y = "Median GOR (MCF/BBL)",
-        color = color_label
-      ) +
-      theme_minimal(base_size = 12) +
-      theme(legend.position = "top")
+    dt[, GOR_Value := ifelse(is.finite(GOR_MCF_PER_BBL) & GOR_MCF_PER_BBL >= 0, GOR_MCF_PER_BBL, NA_real_)]
+    dt[, GasWeight_Value := ifelse(is.finite(GasWeightPct) & GasWeightPct >= 0, GasWeightPct, NA_real_)]
+
+    agg <- dt[, .(
+      Median_GOR_MCF_PER_BBL = {
+        vals <- GOR_Value[is.finite(GOR_Value)]
+        if (length(vals)) stats::median(vals, na.rm = TRUE) else NA_real_
+      },
+      Median_GasWeight_Pct = {
+        vals <- GasWeight_Value[is.finite(GasWeight_Value)]
+        if (length(vals)) stats::median(vals, na.rm = TRUE) else NA_real_
+      },
+      WellCount = data.table::uniqueN(GSL_UWI_STD[is.finite(GOR_Value) | is.finite(GasWeight_Value)])
+    ), by = .(Group, CalendarMonth)]
+
+    agg <- agg[WellCount > 0 | is.finite(Median_GOR_MCF_PER_BBL) | is.finite(Median_GasWeight_Pct)]
+    if (!nrow(agg)) return(data.table::data.table())
+
+    data.table::setorder(agg, CalendarMonth, Group)
+    agg
   })
 
-  output$gas_weighting_by_vintage_plot <- renderPlot({
-    gor_dt <- gor_data_filtered()
-    validate(need(!is.null(gor_dt) && nrow(gor_dt) > 0, "No wells in current filter."))
+  output$gor_trend_by_month_plot <- plotly::renderPlotly({
+    agg <- gor_grouped_series()
+    req(nrow(agg) > 0)
 
-    dsw <- gor_dt[is.finite(GasWeighting) & GasWeighting >= 0 & GasWeighting <= 1]
-    validate(need(nrow(dsw) > 0, "No valid GasWeighting values in range."))
+    plot_dt <- agg[is.finite(Median_GOR_MCF_PER_BBL) & WellCount > 0]
+    req(nrow(plot_dt) > 0)
 
-    plot_dt <- dsw[!is.na(VintageYear) & !is.na(YearOnProduction) & YearOnProduction >= 1]
-    validate(need(nrow(plot_dt) > 0, "No gas weighting data for current filters."))
-
-    plot_dt[, VintageYear := as.character(VintageYear)]
-    agg <- plot_dt[, .(
-      AvgGasWeighting = if (all(is.na(GasWeighting))) NA_real_ else mean(GasWeighting, na.rm = TRUE)
-    ), by = .(VintageYear, YearOnProduction)]
-    agg <- agg[is.finite(AvgGasWeighting)]
-    validate(need(nrow(agg) > 0, "No gas weighting data for current filters."))
-
-    agg[, VintageYear := factor(VintageYear, levels = sort(unique(VintageYear)))]
-    unique_vintages <- levels(agg$VintageYear)
-    vintage_colors <- custom_palette[1:min(length(unique_vintages), length(custom_palette))]
-    if (length(unique_vintages) > length(custom_palette)) {
-      vintage_colors <- rep(custom_palette, length.out = length(unique_vintages))
-    }
-    names(vintage_colors) <- unique_vintages
-
-    ggplot(agg, aes(x = YearOnProduction, y = AvgGasWeighting, color = VintageYear, group = VintageYear)) +
-      geom_line(linewidth = 1.1) +
-      scale_x_continuous(breaks = scales::pretty_breaks(n = 6)) +
-      scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1), oob = scales::squish) +
-      scale_color_manual(values = vintage_colors) +
-      labs(
-        title = "Average gas weighting by vintage",
-        subtitle = "If LiquidsBBL = 0 & GasMCF > 0, weighting = 100%; if both 0, excluded.",
-        x = "Year on Production",
-        y = "Average Gas Weighting",
-        color = "Vintage Year"
+    p <- ggplot2::ggplot(
+      plot_dt,
+      ggplot2::aes(x = CalendarMonth, y = Median_GOR_MCF_PER_BBL, color = Group, group = Group)
+    ) +
+      ggplot2::geom_line(linewidth = 1) +
+      ggplot2::geom_point(size = 1.5) +
+      ggplot2::scale_x_date(date_labels = "%Y-%m", date_breaks = "6 months") +
+      ggplot2::scale_y_continuous(labels = scales::comma) +
+      ggplot2::labs(
+        title = "Median GOR by calendar month",
+        x = "Calendar month",
+        y = "Median GOR (MCF/BBL)",
+        color = "Group"
       ) +
-      theme_minimal(base_size = 12) +
-      theme(legend.position = "top")
+      ggplot2::theme_minimal(base_size = 12) +
+      ggplot2::theme(legend.position = "top")
+
+    plotly::ggplotly(p)
+  })
+
+  output$gas_weighting_by_vintage_plot <- plotly::renderPlotly({
+    agg <- gor_grouped_series()
+    req(nrow(agg) > 0)
+
+    plot_dt <- agg[is.finite(Median_GasWeight_Pct) & WellCount > 0]
+    req(nrow(plot_dt) > 0)
+
+    p <- ggplot2::ggplot(
+      plot_dt,
+      ggplot2::aes(x = CalendarMonth, y = Median_GasWeight_Pct, color = Group, group = Group)
+    ) +
+      ggplot2::geom_line(linewidth = 1) +
+      ggplot2::geom_point(size = 1.5) +
+      ggplot2::scale_x_date(date_labels = "%Y-%m", date_breaks = "6 months") +
+      ggplot2::scale_y_continuous(
+        labels = function(x) paste0(scales::number(x, accuracy = 0.1), "%"),
+        limits = c(0, 100),
+        oob = scales::squish
+      ) +
+      ggplot2::labs(
+        title = "Median gas weighting by calendar month",
+        x = "Calendar month",
+        y = "Gas weighting (%)",
+        color = "Group"
+      ) +
+      ggplot2::theme_minimal(base_size = 12) +
+      ggplot2::theme(legend.position = "top")
+
+    plotly::ggplotly(p)
   })
 
   output$gor_timeseries_table <- DT::renderDataTable({
-    gor_dt <- gor_data_filtered()
-    if (is.null(gor_dt) || nrow(gor_dt) == 0) {
-      return(DT::datatable(data.frame(Message = "No wells in current filter."), options = list(searching = FALSE, paging = FALSE, info = FALSE)))
-    }
+    agg <- gor_grouped_series()
+    req(nrow(agg) > 0)
 
-    display <- data.table::copy(gor_dt)
-    display[, ProdMonth := format(PROD_DATE, "%Y-%m")]
-    display[, WellDisplay := ifelse(!is.na(WellName) & trimws(WellName) != "", WellName, GSL_UWI_STD)]
-    display[, `GOR (MCF/BBL)` := ifelse(
-      is.infinite(GOR_MCF_PER_BBL),
-      "Inf (100% gas)",
-      ifelse(is.na(GOR_MCF_PER_BBL), "NA", scales::comma(GOR_MCF_PER_BBL, accuracy = 0.1))
-    )]
-    display[, `Gas weighting (%)` := ifelse(
-      is.na(GasWeighting),
-      "NA",
-      scales::percent(GasWeighting, accuracy = 0.1)
-    )]
-    display[, MonthOnProduction := as.integer(MonthOnProduction)]
-    display[, YearOnProduction := as.integer(YearOnProduction)]
-    display[, VintageYear := ifelse(is.na(VintageYear), "", as.character(VintageYear))]
-
-    table_dt <- display[, .(
-      Well = WellDisplay,
-      `GSL UWI` = GSL_UWI_STD,
-      Month = ProdMonth,
-      OilBBL = round(OilBBL, 1),
-      CndBBL = round(CndBBL, 1),
-      GasMCF = round(GasMCF, 1),
-      LiquidsBBL = round(LiquidsBBL, 1),
-      `GOR (MCF/BBL)`,
-      `Gas weighting (%)`,
-      MonthOnProduction,
-      YearOnProduction,
-      VintageYear
-    )]
+    table_dt <- data.table::copy(agg)
+    table_dt[, CalendarMonth := format(CalendarMonth, "%Y-%m")]
+    table_dt[, `Median GOR (MCF/BBL)` := round(Median_GOR_MCF_PER_BBL, 2)]
+    table_dt[, `Median Gas weighting (%)` := round(Median_GasWeight_Pct, 2)]
+    table_dt[, `Well count` := WellCount]
 
     DT::datatable(
-      table_dt,
+      table_dt[, .(Group, CalendarMonth, `Median GOR (MCF/BBL)`, `Median Gas weighting (%)`, `Well count`)],
       options = list(pageLength = 15, scrollX = TRUE),
       rownames = FALSE
     )
@@ -2789,26 +4012,742 @@ server <- function(input, output, session) {
   output$download_gor_timeseries_csv <- downloadHandler(
     filename = function() paste0("gor_timeseries_", Sys.Date(), ".csv"),
     content = function(file) {
-      gor_dt <- gor_data_filtered()
-      if (is.null(gor_dt) || nrow(gor_dt) == 0) {
+      agg <- gor_grouped_series()
+      if (is.null(agg) || !nrow(agg)) {
         data.table::fwrite(data.table::data.table(Message = "No GOR data for current filters."), file)
         return()
       }
 
-      export_dt <- data.table::copy(gor_dt)
-      export_dt[, Well := ifelse(!is.na(WellName) & trimws(WellName) != "", WellName, GSL_UWI_STD)]
-      export_dt[, Month := format(PROD_DATE, "%Y-%m-%d")]
-      export_dt[, MonthOnProduction := as.integer(MonthOnProduction)]
-      export_dt[, YearOnProduction := as.integer(YearOnProduction)]
-      export_dt[, VintageYear := as.character(VintageYear)]
-
-      cols <- intersect(
-        c("Well", "GSL_UWI_STD", "OperatorName", "Formation", "FieldName", "ProvinceState", "Month", "OilBBL", "CndBBL", "GasMCF", "LiquidsBBL", "GOR_MCF_PER_BBL", "GasWeighting", "MonthOnProduction", "YearOnProduction", "VintageYear"),
-        names(export_dt)
-      )
-      data.table::fwrite(export_dt[, ..cols], file)
+      export_dt <- data.table::copy(agg)
+      export_dt[, CalendarMonth := format(CalendarMonth, "%Y-%m-%d")]
+      data.table::fwrite(export_dt, file)
     }
   )
+
+  duc_long_dt <- eventReactive(input$duc_apply, {
+    snap_dates <- sort(unique(as.Date(input$duc_dates)))
+    req(length(snap_dates) > 0)
+
+    candidate <- duc_candidate_wells()
+    if (is.null(candidate) || !nrow(candidate)) {
+      message("DUC DEBUG: candidate pool empty before normalization and DUC rules.")
+      return(data.table::data.table(
+        UWI = character(),
+        GSL_UWI = character(),
+        OperatorName = character(),
+        ProvinceState = character(),
+        Formation = character(),
+        FieldName = character(),
+        RigReleaseDate = as.Date(character()),
+        SpudDate = as.Date(character()),
+        DrillDoneDate = as.Date(character()),
+        CompletionDate = as.Date(character()),
+        FirstProdDate = as.Date(character()),
+        AbandonmentDate = as.Date(character()),
+        LicensedSubstance = character(),
+        LaheeUnified = character(),
+        ConfidentialType = character(),
+        SnapshotDate = as.Date(character()),
+        DaysSinceRigRelease = numeric(),
+        MonthsSinceRigRelease = numeric(),
+        MonthsBetweenReleaseAndFirstProd = numeric(),
+        Group = character()
+      ))
+    }
+
+    required_cols <- c(
+      "UWI", "GSL_UWI", "OperatorName", "ProvinceState", "Formation", "FieldName",
+      "RigReleaseDate", "SpudDate", "CompletionDate", "FirstProdDate", "AbandonmentDate", "ConfidentialType",
+      "LicensedSubstance", "CurrentStatus"
+    )
+    for (col in required_cols) {
+      if (!col %in% names(candidate)) {
+        candidate[, (col) := NA]
+      }
+    }
+
+    for (col in intersect(required_cols, c("OperatorName", "ProvinceState", "Formation", "FieldName", "ConfidentialType", "LicensedSubstance", "CurrentStatus"))) {
+      candidate[, (col) := as.character(get(col))]
+    }
+    for (col in c("RigReleaseDate", "SpudDate", "CompletionDate", "FirstProdDate", "AbandonmentDate")) {
+      candidate[, (col) := as.Date(get(col))]
+    }
+
+    duc_pool <- data.table::copy(candidate)
+    if (!"is_abandoned" %in% names(duc_pool)) duc_pool[, is_abandoned := FALSE]
+    duc_pool[is.na(is_abandoned), is_abandoned := FALSE]
+    duc_pool <- duc_pool[is_abandoned == FALSE]
+    duc_pool[, ProvinceState := toupper(trimws(ProvinceState))]
+    duc_pool[ProvinceState %in% c("B.C.", "BC.", "B C", "BRITISH COLUMBIA", "B.C", "B C."), ProvinceState := "BC"]
+    duc_pool[ProvinceState %in% c("ALBERTA", "ALTA", "AB.", "AB "), ProvinceState := "AB"]
+    duc_pool[ProvinceState %in% c("SASK", "SASKATCHEWAN", "SK.", "SK "), ProvinceState := "SK"]
+    duc_pool[, ProvinceState := trimws(ProvinceState)]
+
+    message("DUC DEBUG: unique ProvinceState in duc_pool AFTER normalize:")
+    print(sort(unique(duc_pool$ProvinceState)))
+    message("DUC DEBUG: Province counts BEFORE DUC rules:")
+    print(table(duc_pool$ProvinceState, useNA = 'ifany'))
+    message("DUC DEBUG: RigReleaseDate NA rate by Province:")
+    print(table(duc_pool$ProvinceState, is.na(duc_pool$RigReleaseDate), useNA = 'ifany'))
+    message("DUC DEBUG: ConfidentialType by Province:")
+    print(table(duc_pool$ProvinceState, duc_pool$ConfidentialType, useNA = 'ifany'))
+    message("DUC DEBUG: LicensedSubstance distribution BEFORE DUC rules:")
+    print(table(duc_pool$LicensedSubstance, useNA = 'ifany'))
+    message("DUC DEBUG: Sample BC-like rows BEFORE DUC rules:")
+    print(head(
+      duc_pool[ProvinceState == "BC",
+               .(UWI, ProvinceState, RigReleaseDate, FirstProdDate,
+                 AbandonmentDate, ConfidentialType, OperatorName,
+                 FieldName, Formation, LicensedSubstance)],
+      20
+    ))
+
+    group_candidates <- unique(c(input$duc_group_by, "OperatorName", "Formation", "FieldName", "ProvinceState"))
+    group_candidates <- group_candidates[!is.na(group_candidates)]
+    grp_col <- safe_col(duc_pool, group_candidates)
+    if (is.null(grp_col)) {
+      grp_col <- "OperatorName"
+      if (!"OperatorName" %in% names(duc_pool)) {
+        duc_pool[, OperatorName := NA_character_]
+      }
+    }
+
+    min_hold_days <- as.numeric(input$duc_min_hold_days %||% 30)
+    max_hold_days <- as.numeric(input$duc_max_hold_days %||% 730)
+    recency_months <- as.numeric(input$duc_spud_recency_months %||% 36)
+    max_months_cap <- as.numeric(input$duc_max_months_cap %||% 24)
+    grace_days <- as.numeric(input$duc_grace_days %||% 0)
+    max_age_days <- as.numeric(input$duc_max_age_days %||% 0)
+    exclude_conf <- isTRUE(input$duc_exclude_conf)
+
+    detail_list <- lapply(snap_dates, function(d) {
+      working <- data.table::copy(duc_pool)
+      detail_dt <- duc_detail_for_date(
+        wx_dt = working,
+        snap_date = d,
+        min_hold_days = min_hold_days,
+        max_hold_days = max_hold_days,
+        recency_months = recency_months,
+        max_months_cap = max_months_cap,
+        exclude_conf = exclude_conf,
+        group_col = grp_col,
+        grace_days = grace_days,
+        max_age_days = max_age_days
+      )
+      if (!nrow(detail_dt)) return(data.table::data.table())
+      detail_dt[, DaysSinceRigRelease := round(DaysSinceRigRelease, 0)]
+      detail_dt[, MonthsSinceRigRelease := round(MonthsSinceRigRelease, 1)]
+      detail_dt[, MonthsBetweenReleaseAndFirstProd := round(MonthsBetweenReleaseAndFirstProd, 1)]
+      detail_dt[, RuleMatch := data.table::fifelse(
+        FirstProdBySnapshot,
+        "FirstProdAfterSnapshot",
+        "NoFirstProd + WithinReleaseWindows"
+      )]
+      detail_dt
+    })
+
+    detail_dt <- data.table::rbindlist(detail_list, use.names = TRUE, fill = TRUE)
+    if (!nrow(detail_dt)) {
+      detail_dt <- data.table::data.table(
+        UWI = character(),
+        GSL_UWI = character(),
+        OperatorName = character(),
+        ProvinceState = character(),
+        Formation = character(),
+        FieldName = character(),
+        CurrentStatus = character(),
+        RigReleaseDate = as.Date(character()),
+        SpudDate = as.Date(character()),
+        DrillDoneDate = as.Date(character()),
+        CompletionDate = as.Date(character()),
+        FirstProdDate = as.Date(character()),
+        AbandonmentDate = as.Date(character()),
+        ConfidentialType = character(),
+        LicensedSubstance = character(),
+        LaheeUnified = character(),
+        SnapshotDate = as.Date(character()),
+        DaysSinceRigRelease = numeric(),
+        MonthsSinceRigRelease = numeric(),
+        MonthsBetweenReleaseAndFirstProd = numeric(),
+        CompletedBySnapshot = logical(),
+        FirstProdBySnapshot = logical(),
+        AbandonedBySnapshot = logical(),
+        FailedBecause = character(),
+        Group = character(),
+        RuleMatch = character()
+      )
+    } else {
+      message("DUC DEBUG: Final grouped DUC counts by ProvinceState at each snapshot:")
+      print(
+        detail_dt[
+          , .(DUC_Count = .N), by = .(ProvinceState, SnapshotDate)
+        ][order(SnapshotDate, ProvinceState)]
+      )
+      message("DUC DEBUG: LicensedSubstance distribution AFTER DUC rules:")
+      print(table(detail_dt$LicensedSubstance, useNA = 'ifany'))
+    }
+
+    detail_dt
+  })
+
+  duc_summary_dt <- reactive({
+    detail_dt <- duc_long_dt()
+    if (is.null(detail_dt) || !nrow(detail_dt)) {
+      return(data.table::data.table(Group = character(), SnapshotDate = as.Date(character()), DUC_Count = integer()))
+    }
+    detail_copy <- data.table::copy(detail_dt)
+    data.table::setorder(detail_copy, SnapshotDate)
+    summary_dt <- detail_copy[, .(DUC_Count = .N), by = .(Group, SnapshotDate)][order(SnapshotDate, -DUC_Count)]
+    message("DUC DEBUG: Final grouped DUC counts by ProvinceState at each snapshot (from summary reactive):")
+    print(
+      detail_copy[
+        , .(DUC_Count = .N), by = .(ProvinceState, SnapshotDate)
+      ][order(SnapshotDate, ProvinceState)]
+    )
+    summary_dt
+  })
+
+  observeEvent(duc_summary_dt(), {
+    dt <- duc_summary_dt()
+    groups <- if (!is.null(dt) && nrow(dt) > 0) sort(unique(dt$Group)) else character(0)
+    reactive_vals$duc_groups_available <- groups
+  }, ignoreNULL = FALSE)
+
+  observe({
+    choices <- reactive_vals$duc_substance_choices
+    if (is.null(choices)) choices <- character(0)
+    current <- input$duc_substance_filter
+    valid_selected <- intersect(current, choices)
+    updateSelectizeInput(
+      session,
+      "duc_substance_filter",
+      choices = choices,
+      selected = valid_selected,
+      server = TRUE
+    )
+  })
+
+  output$duc_group_filter_ui <- renderUI({
+    groups <- reactive_vals$duc_groups_available
+    req(!is.null(groups), length(groups) > 0)
+    selectizeInput(
+      "duc_group_filter",
+      label = paste0("Filter ", ifelse(input$duc_group_by == "ProvinceState", "provinces", "groups"), " to display"),
+      choices = groups,
+      multiple = TRUE,
+      selected = groups[1:min(10, length(groups))]
+    )
+  })
+
+  output$duc_headline <- renderText({
+    dt <- duc_summary_dt()
+    if (is.null(dt) || !nrow(dt)) {
+      return("No DUC results yet. Pick snapshot dates and click Calculate.")
+    }
+    snaps <- sort(unique(dt$SnapshotDate))
+    total_by_snap <- dt[, .(TotalDUCs = sum(DUC_Count, na.rm = TRUE)), by = SnapshotDate]
+    paste0(
+      "DUC counts for ", length(snaps), " snapshot(s). ",
+      paste0(
+        format(total_by_snap$SnapshotDate, "%Y-%m-%d"), ": ",
+        total_by_snap$TotalDUCs, " wells",
+        collapse = " | "
+      )
+    )
+  })
+
+  output$duc_bar_compare <- plotly::renderPlotly({
+    dt <- duc_summary_dt()
+    req(!is.null(dt), nrow(dt) > 0)
+
+    if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
+      dt <- dt[Group %in% input$duc_group_filter]
+    }
+    req(nrow(dt) > 0)
+
+    if (identical(input$duc_group_by, "ProvinceState")) {
+      plot_dt <- dt
+    } else {
+      topN <- 20
+      top_groups <- dt[, .(TotalAllSnaps = sum(DUC_Count, na.rm = TRUE)), by = Group][
+        order(-TotalAllSnaps)
+      ][1:min(.N, topN)]$Group
+      plot_dt <- dt[Group %in% top_groups]
+    }
+    req(nrow(plot_dt) > 0)
+
+    p <- ggplot2::ggplot(
+      plot_dt,
+      ggplot2::aes(
+        x = Group,
+        y = DUC_Count,
+        fill = as.factor(SnapshotDate)
+      )
+    ) +
+      ggplot2::geom_col(position = "dodge") +
+      ggplot2::coord_flip() +
+      ggplot2::labs(
+        x = NULL,
+        y = "DUC count",
+        fill = "Snapshot"
+      ) +
+      ggplot2::theme_minimal(base_size = 12)
+
+    plotly::ggplotly(p)
+  })
+
+  output$duc_table <- DT::renderDT({
+    dt <- duc_summary_dt()
+    req(!is.null(dt), nrow(dt) > 0)
+    if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
+      dt <- dt[Group %in% input$duc_group_filter]
+    }
+    req(nrow(dt) > 0)
+    DT::datatable(
+      dt[order(SnapshotDate, -DUC_Count)],
+      rownames = FALSE,
+      options = list(pageLength = 25, scrollX = TRUE)
+    )
+  })
+
+  output$duc_pivot <- DT::renderDataTable({
+    dt <- duc_long_dt()
+    req(!is.null(dt), nrow(dt) > 0)
+    pivot_dt <- dt[, .N, by = .(SnapshotDate, ProvinceState, OperatorName)]
+    if (!nrow(pivot_dt)) {
+      return(DT::datatable(data.frame()))
+    }
+    cast_dt <- tryCatch({
+      data.table::dcast(pivot_dt, SnapshotDate + ProvinceState ~ OperatorName, value.var = "N", fill = 0L)
+    }, error = function(e) {
+      message("DUC DEBUG: pivot cast failed: ", e$message)
+      pivot_dt[, OperatorName := ifelse(is.na(OperatorName) | OperatorName == "", "(Unknown)", OperatorName)]
+      data.table::dcast(pivot_dt, SnapshotDate + ProvinceState ~ OperatorName, value.var = "N", fill = 0L)
+    })
+    DT::datatable(
+      cast_dt,
+      options = list(scrollX = TRUE, pageLength = 10),
+      rownames = FALSE
+    )
+  })
+
+  output$duc_rows <- DT::renderDataTable(DT::datatable(data.frame(), options = list(dom = "t")))
+
+  observe({
+    if (isTRUE(input$duc_show_rows)) {
+      output$duc_rows <- DT::renderDataTable({
+        dt <- duc_long_dt()
+        req(!is.null(dt), nrow(dt) > 0)
+        if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
+          dt <- dt[Group %in% input$duc_group_filter]
+        }
+        req(nrow(dt) > 0)
+        DT::datatable(
+          dt[, .(UWI, OperatorName, ProvinceState, Formation, FieldName,
+                 RigReleaseDate, CompletionDate, FirstProdDate, AbandonmentDate, SnapshotDate)],
+          options = list(server = TRUE, deferRender = TRUE, pageLength = 50, scrollX = TRUE),
+          filter = "top",
+          rownames = FALSE
+        )
+      })
+    } else {
+      output$duc_rows <- DT::renderDataTable(DT::datatable(data.frame(), options = list(dom = "t")))
+    }
+  })
+
+  output$duc_download <- downloadHandler(
+    filename = function() paste0("duc_summary_", Sys.Date(), ".csv"),
+    content = function(file) {
+      sum_dt <- duc_summary_dt()
+      det_dt <- duc_long_dt()
+      if (is.null(sum_dt) || !nrow(sum_dt)) {
+        data.table::fwrite(sum_dt, file)
+        return()
+      }
+      if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
+        sum_dt <- sum_dt[Group %in% input$duc_group_filter]
+        if (!is.null(det_dt) && nrow(det_dt) > 0) {
+          det_dt <- det_dt[Group %in% input$duc_group_filter]
+        }
+      }
+      if (!is.null(det_dt) && nrow(det_dt) > 0) {
+        uwis <- det_dt[, .(UWI_List = paste(sort(unique(UWI)), collapse = "|")), by = .(Group, SnapshotDate)]
+        out <- merge(sum_dt, uwis, by = c("Group", "SnapshotDate"), all.x = TRUE)
+      } else {
+        out <- sum_dt
+      }
+      data.table::fwrite(out[order(SnapshotDate, -DUC_Count)], file)
+    }
+  )
+
+  output$duc_detail_table <- DT::renderDT({
+    dt <- duc_long_dt()
+    req(!is.null(dt), nrow(dt) > 0)
+    if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
+      dt <- dt[Group %in% input$duc_group_filter]
+    }
+    req(nrow(dt) > 0)
+    dt <- dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, FieldName, LicensedSubstance, LaheeUnified, DrillDoneDate, UWI)]
+    DT::datatable(
+      dt,
+      rownames = FALSE,
+      options = list(pageLength = 25, scrollX = TRUE)
+    )
+  })
+
+  output$download_duc_details_csv <- downloadHandler(
+    filename = function() paste0("duc_detail_", Sys.Date(), ".csv"),
+    content = function(file) {
+      dt <- duc_long_dt()
+      if (is.null(dt) || !nrow(dt)) {
+        data.table::fwrite(data.table::data.table(), file)
+        return()
+      }
+      if (!is.null(input$duc_group_filter) && length(input$duc_group_filter) > 0) {
+        dt <- dt[Group %in% input$duc_group_filter]
+      }
+      data.table::fwrite(
+        dt[order(SnapshotDate, Group, OperatorName, ProvinceState, Formation, FieldName, LicensedSubstance, LaheeUnified, DrillDoneDate, UWI)],
+        file
+      )
+    }
+  )
+
+  output$shutin_residual_hint <- renderUI({
+    thr <- suppressWarnings(as.numeric(input$shutin_residual_boe_threshold))
+    if (!is.finite(thr)) thr <- 3
+    shiny::helpText(sprintf("Months with ≤ %.1f BOE are treated as zero for shut-in detection.", thr))
+  })
+
+  observeEvent(input$calculate_shutin, {
+    req(input$shutin_snapshot_date)
+    req(input$shutin_no_prod_months)
+    req(input$shutin_recent_production_window)
+    req(input$shutin_residual_boe_threshold)
+
+    snapshot_date <- as.Date(input$shutin_snapshot_date)
+    no_prod_months <- max(1L, as.integer(input$shutin_no_prod_months))
+    recent_window_mo <- max(0L, as.integer(input$shutin_recent_production_window))
+    residual_threshold <- max(0, as.numeric(input$shutin_residual_boe_threshold))
+
+    reactive_vals$shutin_snapshot <- snapshot_date
+    reactive_vals$shutin_no_prod_months <- no_prod_months
+    reactive_vals$shutin_recent_production_window <- recent_window_mo
+    reactive_vals$shutin_residual_threshold <- residual_threshold
+
+    base_sf <- reactive_vals$wells_filtered_base
+    if (is.null(base_sf) || nrow(base_sf) == 0) {
+      reactive_vals$shutin_summary <- data.table::data.table()
+      reactive_vals$shutin_detail <- data.table::data.table()
+      showNotification("No wells available under current filters for shut-in analysis.", type = "warning", duration = 5)
+      return(invisible(NULL))
+    }
+
+    wells_base <- data.table::as.data.table(sf::st_drop_geometry(base_sf))
+    if (!nrow(wells_base)) {
+      reactive_vals$shutin_summary <- data.table::data.table()
+      reactive_vals$shutin_detail <- data.table::data.table()
+      showNotification("Filtered wells data is empty; cannot compute shut-in results.", type = "warning", duration = 5)
+      return(invisible(NULL))
+    }
+
+    needed_cols <- c("GSL_UWI", "UWI", "OperatorName", "ProvinceState",
+                     "SpudDate", "RigReleaseDate", "FirstProdDate", "AbandonmentDate",
+                     "CurrentStatus", "Formation", "FieldName")
+    for (nc in needed_cols) {
+      if (!nc %in% names(wells_base)) wells_base[, (nc) := NA]
+    }
+
+    date_cols <- intersect(c("SpudDate", "RigReleaseDate", "FirstProdDate", "AbandonmentDate"), names(wells_base))
+    for (dc in date_cols) {
+      wells_base[, (dc) := as.Date(get(dc))]
+    }
+
+    wells_base[, GSL_UWI := trimws(as.character(ifelse("GSL_UWI" %in% names(wells_base), GSL_UWI, NA_character_)))]
+
+    shutin_pool <- data.table::copy(wells_base)
+    shutin_pool[, ProvinceState := toupper(trimws(as.character(ProvinceState)))]
+    shutin_pool[ProvinceState %in% c("B.C.", "BC.", "B C", "BRITISH COLUMBIA", "B.C", "B C."), ProvinceState := "BC"]
+    shutin_pool[ProvinceState %in% c("ALBERTA", "ALTA", "AB.", "AB "), ProvinceState := "AB"]
+    shutin_pool[ProvinceState %in% c("SASK", "SASKATCHEWAN", "SK.", "SK "), ProvinceState := "SK"]
+    shutin_pool[, ProvinceState := trimws(ProvinceState)]
+
+    if (!"is_abandoned" %in% names(shutin_pool)) {
+      shutin_pool[, CurrentStatus := as.character(CurrentStatus)]
+      shutin_pool[, is_abandoned := {
+        st <- toupper(trimws(CurrentStatus))
+        dt <- as.IDate(AbandonmentDate)
+        nz <- !is.na(dt) & dt <= snapshot_date
+        pat <- !is.na(st) & grepl("(^|[^A-Z])ABD|ABAND|ABANDON|ABDN|ABAND'D|ABANDONED", st, perl = TRUE)
+        nz | pat
+      }]
+    }
+    if (!"is_abandoned" %in% names(shutin_pool)) shutin_pool[, is_abandoned := FALSE]
+    shutin_pool[is.na(is_abandoned), is_abandoned := FALSE]
+    shutin_pool <- shutin_pool[is_abandoned == FALSE]
+
+    message("SHUTIN DEBUG: unique ProvinceState in shut-in candidate pool:")
+    print(sort(unique(shutin_pool$ProvinceState)))
+    message("SHUTIN DEBUG: counts by ProvinceState after filters:")
+    print(table(shutin_pool$ProvinceState, useNA = 'ifany'))
+
+    valid_ids <- unique(shutin_pool$GSL_UWI)
+    valid_ids <- valid_ids[!is.na(valid_ids) & valid_ids != ""]
+
+    if (!length(valid_ids)) {
+      reactive_vals$shutin_summary <- data.table::data.table()
+      reactive_vals$shutin_detail <- data.table::data.table()
+      showNotification("No GSL_UWI identifiers available for shut-in analysis.", type = "warning", duration = 5)
+      return(invisible(NULL))
+    }
+
+    last_full_month <- lubridate::floor_date(snapshot_date, unit = "month") - lubridate::days(1)
+    month_end <- lubridate::floor_date(last_full_month, unit = "month")
+    silent_months <- if (no_prod_months > 0) {
+      rev(lubridate::floor_date(month_end - lubridate::months(seq_len(no_prod_months) - 1L), unit = "month"))
+    } else {
+      as.Date(character())
+    }
+    recent_months <- if (recent_window_mo > 0) {
+      rev(lubridate::floor_date(month_end - lubridate::months(seq_len(recent_window_mo) - 1L), unit = "month"))
+    } else {
+      as.Date(character())
+    }
+    window_months_all <- sort(unique(c(silent_months, recent_months)))
+    if (!length(window_months_all)) {
+      window_months_all <- month_end
+    }
+
+    month_start <- min(window_months_all)
+    message(
+      "SHUTIN SNAPSHOT: ", snapshot_date,
+      " | nCandidates=", nrow(shutin_pool),
+      " | month_start=", as.character(month_start),
+      " | no_prod_start=", ifelse(length(silent_months), as.character(min(silent_months)), NA_character_),
+      " | month_end=", as.character(max(window_months_all))
+    )
+
+    if (is.null(con) || !DBI::dbIsValid(con)) {
+      con <<- connect_to_db()
+    }
+    if (is.null(con) || !DBI::dbIsValid(con)) {
+      reactive_vals$shutin_summary <- data.table::data.table()
+      reactive_vals$shutin_detail <- data.table::data.table()
+      showNotification("Database connection is unavailable for shut-in analysis.", type = "error", duration = 5)
+      return(invisible(NULL))
+    }
+
+    year_from <- max(1900L, min(lubridate::year(window_months_all)) - 1L)
+    year_to <- lubridate::year(snapshot_date)
+
+    fetch_res <- batch_fetch_pden(con, valid_ids, year_from, year_to)
+    prod_dt <- fetch_res$data
+    if (isTRUE(fetch_res$partial)) {
+      showNotification("Production data incomplete for some wells; shut-in results may be conservative.", type = "warning", duration = 6)
+    }
+
+    message("SHUTIN DEBUG: production rows fetched=", nrow(prod_dt))
+
+    monthly_totals <- reshape_pden_monthlies(prod_dt)
+    if (!nrow(monthly_totals)) {
+      reactive_vals$shutin_summary <- data.table::data.table()
+      reactive_vals$shutin_detail <- data.table::data.table()
+      showNotification("No shut-in wells found (no production history available for the selected set).", type = "warning", duration = 5)
+      return(invisible(NULL))
+    }
+
+    monthly_totals <- monthly_totals[PROD_DATE <= month_end]
+    monthly_totals[, TotalBOE := (OilBBL + CndBBL) + (GasMCF / MCF_PER_BOE)]
+    monthly_totals[is.na(TotalBOE), TotalBOE := 0]
+    monthly_totals[, Zeroish := is_zeroish(TotalBOE, tol = residual_threshold)]
+
+    first_inferred <- infer_first_prod_date(monthly_totals, residual_threshold, MCF_PER_BOE)
+    last_prod_month <- monthly_totals[Zeroish == FALSE & PROD_DATE <= month_end,
+                                      .(LastProdMonth = max(PROD_DATE)), by = GSL_UWI]
+
+    if (length(window_months_all)) {
+      window_grid <- data.table::CJ(GSL_UWI = unique(valid_ids), PROD_DATE = window_months_all, unique = TRUE)
+      window_grid <- merge(
+        window_grid,
+        monthly_totals[, .(GSL_UWI, PROD_DATE, TotalBOE, Zeroish)],
+        by = c("GSL_UWI", "PROD_DATE"),
+        all.x = TRUE,
+        sort = FALSE
+      )
+      window_grid[is.na(TotalBOE), TotalBOE := 0]
+      window_grid[is.na(Zeroish), Zeroish := is_zeroish(TotalBOE, tol = residual_threshold)]
+    } else {
+      window_grid <- data.table::data.table(GSL_UWI = unique(valid_ids), PROD_DATE = as.Date(character()), TotalBOE = numeric(), Zeroish = logical())
+    }
+
+    if (recent_window_mo > 0) {
+      recent_flag <- window_grid[PROD_DATE %in% recent_months,
+                                 .(had_recent_prod = any(!Zeroish, na.rm = TRUE)),
+                                 by = GSL_UWI]
+    } else {
+      recent_flag <- data.table::data.table(GSL_UWI = unique(valid_ids), had_recent_prod = TRUE)
+    }
+
+    silent_flag <- window_grid[PROD_DATE %in% silent_months,
+                               .(SilentAllZero = all(Zeroish, na.rm = TRUE)),
+                               by = GSL_UWI]
+    if (!nrow(silent_flag)) {
+      silent_flag <- data.table::data.table(GSL_UWI = unique(valid_ids), SilentAllZero = FALSE)
+    }
+
+    shutin <- merge(shutin_pool, first_inferred, by = "GSL_UWI", all.x = TRUE)
+    shutin <- merge(shutin, last_prod_month, by = "GSL_UWI", all.x = TRUE)
+    shutin <- merge(shutin, recent_flag, by = "GSL_UWI", all.x = TRUE)
+    shutin <- merge(shutin, silent_flag, by = "GSL_UWI", all.x = TRUE)
+
+    shutin[is.na(had_recent_prod), had_recent_prod := (recent_window_mo == 0)]
+    shutin[is.na(SilentAllZero), SilentAllZero := FALSE]
+
+    shutin[, FirstProdDate := as.Date(FirstProdDate)]
+    shutin[, AbandonmentDate := as.Date(AbandonmentDate)]
+    shutin[, FirstProdDateInferred := as.Date(FirstProdDateInferred)]
+    shutin[, LastProdMonth := as.Date(LastProdMonth)]
+    shutin[, MonthsSinceLastProd := ifelse(
+      !is.na(LastProdMonth),
+      round(as.numeric(snapshot_date - LastProdMonth) / 30.4375, 1),
+      NA_real_
+    )]
+
+    shutin[, HasProductionHistory := (
+      (!is.na(FirstProdDate) & FirstProdDate <= snapshot_date) |
+        (!is.na(FirstProdDateInferred) & FirstProdDateInferred <= snapshot_date)
+    )]
+
+    shutin_flagged <- shutin[
+      HasProductionHistory &
+        (is.na(AbandonmentDate) | AbandonmentDate > snapshot_date) &
+        had_recent_prod &
+        SilentAllZero
+    ]
+
+    message("SHUTIN DEBUG: counts by ProvinceState after rules:")
+    print(table(shutin_flagged$ProvinceState, useNA = 'ifany'))
+
+    if (!nrow(shutin_flagged)) {
+      reactive_vals$shutin_summary <- data.table::data.table()
+      reactive_vals$shutin_detail <- data.table::data.table()
+      showNotification("No shut-in wells match the current criteria.", type = "message", duration = 5)
+      return(invisible(NULL))
+    }
+
+    shutin_flagged[, OperatorName := ifelse(is.na(OperatorName) | OperatorName == "", "(Unknown)", as.character(OperatorName))]
+
+    shutin_summary <- shutin_flagged[
+      , .(SHUTIN_WELL_COUNT = .N), by = .(OperatorName)
+    ][order(-SHUTIN_WELL_COUNT, OperatorName)]
+    shutin_summary[, SnapshotDate := snapshot_date]
+
+    shutin_detail <- shutin_flagged[, .(
+      SnapshotDate = snapshot_date,
+      UWI,
+      GSL_UWI,
+      OperatorName,
+      ProvinceState,
+      Formation,
+      FieldName,
+      RigReleaseDate = as.Date(RigReleaseDate),
+      SpudDate = as.Date(SpudDate),
+      FirstProdDate = as.Date(FirstProdDate),
+      FirstProdDateInferred = as.Date(FirstProdDateInferred),
+      LastProdMonth = as.Date(LastProdMonth),
+      MonthsSinceLastProd,
+      ResidualThresholdBOE = residual_threshold,
+      NoProductionMonthsThreshold = no_prod_months,
+      RecentActivityWindowMonths = recent_window_mo,
+      AbandonmentDate = as.Date(AbandonmentDate),
+      CurrentStatus,
+      is_abandoned
+    )]
+
+    reactive_vals$shutin_summary <- shutin_summary
+    reactive_vals$shutin_detail <- shutin_detail
+
+    showNotification(
+      paste0(
+        "Identified ",
+        format(nrow(shutin_detail), big.mark = ","),
+        " shut-in wells as of ",
+        snapshot_date,
+        "."
+      ),
+      type = "message",
+      duration = 4
+    )
+  })
+
+  output$shutin_plot <- renderPlot({
+    summary_dt <- reactive_vals$shutin_summary
+    snapshot_date <- reactive_vals$shutin_snapshot
+    no_prod_months <- reactive_vals$shutin_no_prod_months
+    recent_window_mo <- reactive_vals$shutin_recent_production_window
+    residual_threshold <- reactive_vals$shutin_residual_threshold %||% 3
+    req(!is.null(summary_dt), !is.na(snapshot_date), !is.na(no_prod_months), !is.na(recent_window_mo))
+    validate(need(nrow(summary_dt) > 0, "No shut-in wells match the current criteria."))
+
+    ggplot(summary_dt,
+           aes(x = reorder(OperatorName, SHUTIN_WELL_COUNT), y = SHUTIN_WELL_COUNT)) +
+      geom_col(fill = "#4a90e2") +
+      coord_flip() +
+      labs(
+        x = "Operator",
+        y = "Shut-in well count",
+        title = paste0(
+          "Shut-in wells as of ",
+          format(snapshot_date, "%Y-%m-%d"),
+          " (recent window = ",
+          recent_window_mo,
+          " mo; zero production window = ",
+          no_prod_months,
+          " mo; residual threshold = ",
+          residual_threshold,
+          " BOE)"
+        )
+      ) +
+      theme_minimal(base_size = 12)
+  })
+
+  output$shutin_table <- DT::renderDT({
+    detail_dt <- reactive_vals$shutin_detail
+    req(!is.null(detail_dt))
+    validate(need(nrow(detail_dt) > 0, "No shut-in wells match the current criteria."))
+
+    detail_dt[order(SnapshotDate, OperatorName, ProvinceState, Formation, FieldName, NoProductionMonthsThreshold, RecentActivityWindowMonths, GSL_UWI)]
+  },
+  options = list(pageLength = 25, scrollX = TRUE),
+  rownames = FALSE)
+
+  output$shutin_summary_download <- downloadHandler(
+    filename = function() paste0("shutin_summary_", Sys.Date(), ".csv"),
+    content = function(file) {
+      dt <- reactive_vals$shutin_summary
+      if (is.null(dt) || !nrow(dt)) {
+        data.table::fwrite(data.table::data.table(), file)
+      } else {
+        data.table::fwrite(dt[order(SnapshotDate, -SHUTIN_WELL_COUNT, OperatorName)], file)
+      }
+    }
+  )
+
+  output$shutin_detail_download <- downloadHandler(
+    filename = function() paste0("shutin_detail_", Sys.Date(), ".csv"),
+    content = function(file) {
+      dt <- reactive_vals$shutin_detail
+      if (is.null(dt) || !nrow(dt)) {
+        data.table::fwrite(data.table::data.table(), file)
+      } else {
+        data.table::fwrite(
+          dt[order(SnapshotDate, OperatorName, ProvinceState, Formation, FieldName, NoProductionMonthsThreshold, RecentActivityWindowMonths, GSL_UWI)],
+          file
+        )
+      }
+    }
+  )
+
 
   filtered_group_cumulative_data <- eventReactive(input$calculate_filtered_cumulative, {
     req(wells_sf_global, input$product_type_filter_analysis, input$filtered_group_breakout_by)
